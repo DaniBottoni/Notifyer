@@ -5,7 +5,14 @@ const http = require('http'), https = require('https');
 const { XMLParser } = require('fast-xml-parser');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+// Render's network often can't route to Postgres over IPv6 — force IPv4.
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    lookup: (hostname, options, cb) => dns.lookup(hostname, { family: 4 }, cb),
+});
+pool.on('error', e => console.error('⚠️ Postgres pool error:', e.message));
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 
 const PLATFORMS = {
@@ -560,3 +567,14 @@ client.on('error', e => console.error('⚠️ Discord client error:', e));
 
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => { const ok = req.url === '/' || req.url === '/health'; res.writeHead(ok ? 200 : 404, { 'Content-Type': 'text/plain' }); res.end(ok ? 'Social notify bot is running!' : 'Not found'); }).listen(PORT, () => console.log(`🌐 HTTP server on port ${PORT}`));
+
+// Keep-alive: ping our own URL periodically so Render's free tier doesn't spin down.
+const KEEP_ALIVE_URL = process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE_URL;
+if (KEEP_ALIVE_URL) {
+    setInterval(() => {
+        https.get(`${KEEP_ALIVE_URL.replace(/\/$/, '')}/health`, res => res.resume())
+            .on('error', e => console.error('⚠️ Keep-alive ping failed:', e.message));
+    }, 10 * 60 * 1000); // every 10 minutes
+} else {
+    console.log('ℹ️ KEEP_ALIVE_URL/RENDER_EXTERNAL_URL not set — self-ping disabled.');
+}
