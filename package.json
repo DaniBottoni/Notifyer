@@ -1,0 +1,17 @@
+{
+  "name": "social-notify-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "pg": "^8.13.1",
+    "fast-xml-parser": "^4.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
