@@ -1,18 +1,39 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { Pool } = require('pg');
-const dns = require('dns'); dns.setDefaultResultOrder('ipv4first');
+const dns = require('dns');
 const http = require('http'), https = require('https');
 const { XMLParser } = require('fast-xml-parser');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-// Render's network often can't route to Postgres over IPv6 — force IPv4.
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-    lookup: (hostname, options, cb) => dns.lookup(hostname, { family: 4 }, cb),
-});
+let pool; // created in initDB() after resolving the DB host to IPv4
+pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 pool.on('error', e => console.error('⚠️ Postgres pool error:', e.message));
+
+// Render's managed Postgres hostnames sometimes only resolve to IPv6 on the
+// default resolver, which Render's network can't route (ENETUNREACH). Force
+// an IPv4 lookup and rebuild the pool against the resolved IP if needed.
+async function ensureIPv4Pool() {
+    if (!process.env.DATABASE_URL) return;
+    try {
+        const url = new URL(process.env.DATABASE_URL);
+        const { address } = await new Promise((resolve, reject) =>
+            dns.lookup(url.hostname, { family: 4 }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
+        );
+        if (address && address !== url.hostname) {
+            const original = url.hostname;
+            url.hostname = address;
+            await pool.end().catch(() => {});
+            pool = new Pool({
+                connectionString: url.toString(),
+                ssl: { rejectUnauthorized: false, servername: original }, // keep SNI/cert check against original hostname
+            });
+            pool.on('error', e => console.error('⚠️ Postgres pool error:', e.message));
+            console.log(`🔧 Using IPv4 address ${address} for Postgres host ${original}`);
+        }
+    } catch (e) {
+        console.error('⚠️ IPv4 DB lookup failed, using default resolver:', e.message);
+    }
+}
 const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
 
 const PLATFORMS = {
@@ -558,7 +579,12 @@ client.on('interactionCreate', async interaction => {
 });
 
 (async () => {
-    await initDB();
+    await ensureIPv4Pool();
+    try {
+        await initDB();
+    } catch (e) {
+        console.error('⚠️ initDB failed, starting bot anyway:', e.message);
+    }
     await client.login(process.env.DISCORD_TOKEN);
 })();
 
