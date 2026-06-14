@@ -409,6 +409,8 @@ client.once('ready', async () => {
                 .addStringOption(o => o.setName('message').setDescription('Custom message (supports {author} {handle} {platform} {title} {url})')))
             .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
             .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
+            .addSubcommand(s => s.setName('debug').setDescription('Show live fetch result vs stored baseline for a watch')
+                .addIntegerOption(o => o.setName('id').setDescription('Watch ID (see /social list)').setRequired(true)))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
         new SlashCommandBuilder().setName('config').setDescription('Configure the bot')
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
@@ -512,6 +514,36 @@ client.on('interactionCreate', async interaction => {
                 await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
                 await pollAll();
                 return interaction.editReply('✅ Checked all tracked accounts for new posts.');
+            }
+
+            if (sub === 'debug') {
+                await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+                const id = interaction.options.getInteger('id');
+                const watches = await getWatches(guildId);
+                const w = watches.find(x => x.id === id);
+                if (!w) return interaction.editReply(`❌ No watch with ID \`${id}\` in this server. Use \`/social list\` to see IDs.`);
+
+                let post = null, fetchError = null;
+                try { post = await fetchLatestPost(w.platform, w.handle); }
+                catch (e) { fetchError = e.message; }
+
+                const embed = E('#5865F2', `Debug — ${PLATFORMS[w.platform].label} ${w.handle}`)
+                    .addFields(
+                        { name: 'Stored baseline (last_post_id)', value: w.last_post_id ? `\`${w.last_post_id}\`` : '*(none yet)*' },
+                        { name: 'Last checked', value: w.last_checked ? `<t:${Math.floor(w.last_checked / 1000)}:R>` : '*(never)*' },
+                    );
+                if (fetchError) {
+                    embed.addFields({ name: 'Live fetch', value: `❌ Error: ${fetchError}` }).setColor('#ff0000');
+                } else if (!post) {
+                    embed.addFields({ name: 'Live fetch', value: '⚠️ Returned no post (account empty or unparsable).' });
+                } else {
+                    embed.addFields(
+                        { name: 'Live fetch — latest post ID', value: `\`${post.id}\`` },
+                        { name: 'Matches baseline?', value: post.id === w.last_post_id ? '✅ Yes — no notification will fire' : '🆕 Different — notification should fire on next poll/check' },
+                        { name: 'Live post', value: post.title ? `[${post.title.slice(0, 150)}](${post.url})` : (post.url || 'N/A') },
+                    );
+                }
+                return interaction.editReply({ embeds: [embed] });
             }
         }
         return;
