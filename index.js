@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { Pool } = require('pg');
 const dns = require('dns');
 const http = require('http'), https = require('https');
@@ -62,6 +62,8 @@ async function initDB() {
         );
         CREATE INDEX IF NOT EXISTS watches_guild ON watches(guild_id);
         CREATE INDEX IF NOT EXISTS watches_platform ON watches(platform);
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS role_id TEXT;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
     `);
 }
 
@@ -98,6 +100,19 @@ async function removeWatch(guildId, id) {
 }
 async function updateWatchTemplate(guildId, id, template) {
     await pool.query('UPDATE watches SET message_template = $1 WHERE guild_id = $2 AND id = $3', [template, guildId, id]);
+}
+async function updateWatchRole(guildId, id, roleId) {
+    await pool.query('UPDATE watches SET role_id = $1 WHERE guild_id = $2 AND id = $3', [roleId, guildId, id]);
+}
+async function updateWatchActive(guildId, id, active) {
+    await pool.query('UPDATE watches SET active = $1 WHERE guild_id = $2 AND id = $3', [active, guildId, id]);
+}
+async function updateWatchChannel(guildId, id, channelId) {
+    await pool.query('UPDATE watches SET channel_id = $1 WHERE guild_id = $2 AND id = $3', [channelId, guildId, id]);
+}
+async function getWatch(guildId, id) {
+    const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 AND id = $2', [guildId, id]);
+    return res.rows[0] || null;
 }
 async function updateLastPost(id, lastPostId) {
     await pool.query('UPDATE watches SET last_post_id = $1, last_checked = $2 WHERE id = $3', [lastPostId, Date.now(), id]);
@@ -352,6 +367,7 @@ async function pollAll() {
     try {
         const watches = await getAllWatches();
         for (const w of watches) {
+            if (!w.active) continue;
             try {
                 const post = await fetchLatestPost(w.platform, w.handle);
                 if (!post || !post.id) { await touchLastChecked(w.id); continue; }
@@ -365,7 +381,8 @@ async function pollAll() {
                 const guild = client.guilds.cache.get(w.guild_id);
                 const channel = guild?.channels.cache.get(w.channel_id);
                 if (!channel) continue;
-                const content = renderTemplate(w.message_template, post, w.platform, w.handle);
+                let content = renderTemplate(w.message_template, post, w.platform, w.handle);
+                if (w.role_id) content = `<@&${w.role_id}> ${content}`;
                 const embed = new EmbedBuilder()
                     .setColor(PLATFORMS[w.platform].color)
                     .setAuthor({ name: `${post.author || w.handle} • ${PLATFORMS[w.platform].label}` })
@@ -390,7 +407,7 @@ async function pollAll() {
 }
 
 // ── Embeds / UI builders ──────────────────────────────────────────────────
-const refreshBtn = (id) => new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary));
+const refreshBtn = (id) => new ButtonBuilder().setCustomId(id).setLabel('↻ Refresh').setStyle(ButtonStyle.Secondary);
 
 async function buildWatchListEmbed(guildId) {
     const watches = await getWatches(guildId);
@@ -401,32 +418,57 @@ async function buildWatchListEmbed(guildId) {
         .setDescription(`Tracking **${watches.length}** account${watches.length > 1 ? 's' : ''}.`);
     for (const w of watches.slice(0, 25)) {
         const p = PLATFORMS[w.platform];
+        const lines = [
+            `Posts to <#${w.channel_id}>`,
+            `ID: \`${w.id}\``,
+            w.message_template ? `Custom message: \`${w.message_template.slice(0, 80)}${w.message_template.length > 80 ? '…' : ''}\`` : 'Using default message',
+        ];
+        if (w.role_id) lines.push(`Ping: <@&${w.role_id}>`);
+        if (!w.active) lines.push('⏸️ Paused');
         embed.addFields({
-            name: `${p.emoji} ${p.label} — ${w.handle}`,
-            value: `Posts to <#${w.channel_id}>\nID: \`${w.id}\`${w.message_template ? `\nCustom message: \`${w.message_template.slice(0, 80)}${w.message_template.length > 80 ? '…' : ''}\`` : '\nUsing default message'}`,
+            name: `${p.emoji} ${p.label} — ${w.handle}${w.active ? '' : ' (paused)'}`,
+            value: lines.join('\n'),
             inline: false,
         });
     }
     if (watches.length > 25) embed.setFooter({ text: `Showing first 25 of ${watches.length}` });
-    const components = [refreshBtn(`sociallist_refresh_${guildId}`)];
-    if (watches.length) {
-        components.unshift(new ActionRowBuilder().addComponents(
-            new StringSelectMenuBuilder().setCustomId(`sociallist_remove_${guildId}`).setPlaceholder('Remove a watch…')
+    const components = [
+        new ActionRowBuilder().addComponents(
+            new StringSelectMenuBuilder().setCustomId(`sociallist_manage_${guildId}`).setPlaceholder('Manage a watch…')
                 .addOptions(watches.slice(0, 25).map(w => ({ label: `${PLATFORMS[w.platform].label} — ${w.handle}`.slice(0, 100), value: `${w.id}` })))
-        ));
-        components.push(new ActionRowBuilder().addComponents(
-            new StringSelectMenuBuilder().setCustomId(`sociallist_editmsg_${guildId}`).setPlaceholder('Edit custom message for…')
-                .addOptions(watches.slice(0, 25).map(w => ({ label: `${PLATFORMS[w.platform].label} — ${w.handle}`.slice(0, 100), value: `${w.id}` })))
-        ));
-    }
+        ),
+        new ActionRowBuilder().addComponents(refreshBtn(`sociallist_refresh_${guildId}`)),
+    ];
     return { embeds: [embed], components };
+}
+
+function buildManageView(w) {
+    const p = PLATFORMS[w.platform];
+    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emoji} ${w.handle}`).setTimestamp()
+        .addFields(
+            { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
+            { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },
+            { name: 'Ping role', value: w.role_id ? `<@&${w.role_id}>` : 'None', inline: true },
+            { name: 'Message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
+        );
+    const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`socialmanage_msg_${w.id}`).setLabel('Edit Message').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`socialmanage_role_${w.id}`).setLabel('Set/Clear Ping Role').setStyle(ButtonStyle.Secondary),
+    );
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`socialmanage_toggle_${w.id}`).setLabel(w.active ? 'Pause' : 'Resume').setStyle(w.active ? ButtonStyle.Secondary : ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`socialmanage_remove_${w.id}`).setLabel('Remove').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`socialmanage_back_${w.guild_id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
+    );
+    return { embeds: [embed], components: [row1, row2] };
 }
 
 const helpEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Social Notify Bot')
     .setDescription('Get notified in a channel whenever a tracked account posts new content.')
     .addFields(
         { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel. Optionally set a custom message.' },
-        { name: '/social list', value: 'View all tracked accounts. Use the dropdowns to remove a watch or edit its custom message.' },
+        { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
         { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
         { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
         { name: 'Notes', value: 'Checks run every 5 minutes. New watches start tracking from the next post onward (no notification for existing content). TikTok/Instagram/Twitter rely on unofficial scraping and may occasionally fail or lag.' },
@@ -492,7 +534,7 @@ client.on('interactionCreate', async interaction => {
                 if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return reply('❌ Only administrators can change access settings.');
                 await interaction.reply({
                     embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('🔒 Access Configuration').setDescription('Select which role should have access to `/social` commands.\n\n**Note:** Server administrators always have access.').setFooter({ text: 'Select a role from the dropdown below' })],
-                    components: [new ActionRowBuilder().addComponents(new (require('discord.js').RoleSelectMenuBuilder)().setCustomId(`social_access_role_${guildId}`).setPlaceholder('Select a role for access').setMinValues(1).setMaxValues(1))],
+                    components: [new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder().setCustomId(`social_access_role_${guildId}`).setPlaceholder('Select a role for access').setMinValues(1).setMaxValues(1))],
                     flags: [MessageFlags.Ephemeral],
                 });
                 return;
@@ -604,38 +646,128 @@ client.on('interactionCreate', async interaction => {
         return interaction.update({ embeds, components });
     }
 
-    // ── Select: remove watch ────────────────────────────────────────────────
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sociallist_remove_')) {
+    // ── Select: open manage view for a watch ────────────────────────────────
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sociallist_manage_')) {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const id = parseInt(interaction.values[0], 10);
-        await removeWatch(guildId, id);
-        const { embeds, components } = await buildWatchListEmbed(guildId);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.reply({ content: '❌ Watch not found (it may have been removed).', flags: [MessageFlags.Ephemeral] });
+        const { embeds, components } = buildManageView(w);
         return interaction.update({ embeds, components });
     }
 
-    // ── Select: edit custom message -> open modal ──────────────────────────
-    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sociallist_editmsg_')) {
+    // ── Buttons: manage view actions ─────────────────────────────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('socialmanage_')) {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = interaction.values[0];
-        const modal = new ModalBuilder().setCustomId(`socialmsg_modal_${id}`).setTitle('Edit Notification Message')
-            .addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('template').setLabel('Message (use {author} {handle} {platform} {title} {url})')
-                        .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)
-                        .setPlaceholder(DEFAULT_TEMPLATE)
-                )
-            );
-        return interaction.showModal(modal);
+        const [, action, idStr] = interaction.customId.split('_');
+
+        if (action === 'back') {
+            const { embeds, components } = await buildWatchListEmbed(guildId);
+            return interaction.update({ embeds, components });
+        }
+
+        const id = parseInt(idStr, 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.update({ content: '❌ Watch not found (it may have been removed).', embeds: [], components: [] });
+
+        if (action === 'msg') {
+            const modal = new ModalBuilder().setCustomId(`socialmsg_modal_${id}`).setTitle('Edit Notification Message')
+                .addComponents(
+                    new ActionRowBuilder().addComponents(
+                        new TextInputBuilder().setCustomId('template').setLabel('Message (use {author} {handle} {platform} {title} {url})')
+                            .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)
+                            .setValue(w.message_template || '')
+                            .setPlaceholder(DEFAULT_TEMPLATE)
+                    )
+                );
+            return interaction.showModal(modal);
+        }
+
+        if (action === 'channel') {
+            return interaction.update({
+                embeds: [E('#5865F2', `Change Channel — ${w.handle}`).setDescription('Select the new channel for this watch\'s notifications.')],
+                components: [new ActionRowBuilder().addComponents(
+                    new ChannelSelectMenuBuilder().setCustomId(`socialchannel_select_${id}`).setPlaceholder('Select a channel…')
+                        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+                )],
+            });
+        }
+
+        if (action === 'role') {
+            return interaction.update({
+                embeds: [E('#5865F2', `Ping Role — ${w.handle}`).setDescription('Select a role to ping on every notification, or click "Clear Role" to remove it.')],
+                components: [
+                    new ActionRowBuilder().addComponents(
+                        new RoleSelectMenuBuilder().setCustomId(`socialrole_select_${id}`).setPlaceholder('Select a role…')
+                    ),
+                    new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`socialrole_clear_${id}`).setLabel('Clear Role').setStyle(ButtonStyle.Danger),
+                        new ButtonBuilder().setCustomId(`socialmanage_backto_${id}`).setLabel('← Back').setStyle(ButtonStyle.Secondary),
+                    ),
+                ],
+            });
+        }
+
+        if (action === 'toggle') {
+            await updateWatchActive(guildId, id, !w.active);
+            const updated = await getWatch(guildId, id);
+            const { embeds, components } = buildManageView(updated);
+            return interaction.update({ embeds, components });
+        }
+
+        if (action === 'remove') {
+            await removeWatch(guildId, id);
+            const { embeds, components } = await buildWatchListEmbed(guildId);
+            return interaction.update({ content: `✅ Removed ${PLATFORMS[w.platform].label} — ${w.handle}.`, embeds, components });
+        }
+
+        if (action === 'backto') {
+            const { embeds, components } = buildManageView(w);
+            return interaction.update({ content: null, embeds, components });
+        }
+    }
+
+    // ── Select: change channel ───────────────────────────────────────────────
+    if (interaction.isChannelSelectMenu() && interaction.customId.startsWith('socialchannel_select_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const id = parseInt(interaction.customId.slice(21), 10);
+        const channelId = interaction.values[0];
+        await updateWatchChannel(guildId, id, channelId);
+        const w = await getWatch(guildId, id);
+        const { embeds, components } = buildManageView(w);
+        return interaction.update({ embeds, components });
+    }
+
+    // ── Select: set ping role ────────────────────────────────────────────────
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('socialrole_select_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const id = parseInt(interaction.customId.slice(18), 10);
+        const roleId = interaction.values[0];
+        await updateWatchRole(guildId, id, roleId);
+        const w = await getWatch(guildId, id);
+        const { embeds, components } = buildManageView(w);
+        return interaction.update({ embeds, components });
+    }
+
+    // ── Button: clear ping role ──────────────────────────────────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('socialrole_clear_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const id = parseInt(interaction.customId.slice(17), 10);
+        await updateWatchRole(guildId, id, null);
+        const w = await getWatch(guildId, id);
+        const { embeds, components } = buildManageView(w);
+        return interaction.update({ embeds, components });
     }
 
     // ── Modal: save custom message ──────────────────────────────────────────
     if (interaction.isModalSubmit() && interaction.customId.startsWith('socialmsg_modal_')) {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = parseInt(interaction.customId.slice(15), 10);
+        const id = parseInt(interaction.customId.slice(16), 10);
         const template = interaction.fields.getTextInputValue('template').trim() || null;
         await updateWatchTemplate(guildId, id, template);
         await interaction.deferUpdate();
-        const { embeds, components } = await buildWatchListEmbed(guildId);
+        const w = await getWatch(guildId, id);
+        const { embeds, components } = buildManageView(w);
         return interaction.editReply({ embeds, components });
     }
 
