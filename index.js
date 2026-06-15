@@ -164,12 +164,25 @@ function profileUrl(platform, handle) {
 async function fetchLatestYouTube(handle) {
     let channelId = handle;
     if (handle.startsWith('@') || !/^UC[\w-]{22}$/.test(handle)) {
-        // Resolve handle -> channel id via the channel page
+        // Resolve handle -> channel id via the channel page.
         const url = handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/${handle.startsWith('c/') || handle.startsWith('user/') ? handle : '@' + handle}`;
         const html = await fetchText(url);
-        const m = html.match(/"channelId":"(UC[\w-]{22})"/);
+        // Prefer the canonical link (most reliable — points at the page's own channel)
+        let m = html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[\w-]{22})"/);
+        // Fall back to the channel metadata's externalId field
+        if (!m) m = html.match(/"externalId":"(UC[\w-]{22})"/);
+        // Last resort: first generic channelId occurrence
+        if (!m) m = html.match(/"channelId":"(UC[\w-]{22})"/);
         if (!m) throw new Error('Could not resolve YouTube channel ID');
         channelId = m[1];
+
+        // Sanity check: confirm the resolved channel's handle matches what was requested
+        if (handle.startsWith('@')) {
+            const handleMatch = html.match(/"channelHandleText":\{"runs":\[\{"text":"(@[^"]+)"/) || html.match(/"vanityChannelUrl":"https:\/\/www\.youtube\.com\/(@[^"]+)"/);
+            if (handleMatch && handleMatch[1].toLowerCase() !== handle.toLowerCase()) {
+                throw new Error(`Resolved to a different channel handle (${handleMatch[1]}) than requested (${handle}) — check the spelling/casing`);
+            }
+        }
     }
     const feedUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
     const xml = await fetchText(feedUrl);
