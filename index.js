@@ -360,7 +360,10 @@ async function pollAll() {
                     .setDescription(post.title || null)
                     .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
                 if (post.thumbnail) embed.setImage(post.thumbnail);
-                await channel.send({ content, embeds: [embed] }).catch(e => console.error('send notification:', e.message));
+                const linkRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setLabel('View post').setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(PLATFORMS[w.platform].emoji)
+                );
+                await channel.send({ content, embeds: [embed], components: [linkRow] }).catch(e => console.error('send notification:', e.message));
             } catch (e) {
                 console.error(`poll ${w.platform}/${w.handle}:`, e.message);
                 await touchLastChecked(w.id).catch(() => {});
