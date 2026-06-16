@@ -42,7 +42,7 @@ const PLATFORMS = {
     tiktok:    { label: 'TikTok',    emoji: '🎵', color: '#000000' },
     instagram: { label: 'Instagram', emoji: '📸', color: '#E1306C' },
 };
-const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 
 // ── DB ─────────────────────────────────────────────────────────────────────
 async function initDB() {
@@ -64,6 +64,13 @@ async function initDB() {
         CREATE INDEX IF NOT EXISTS watches_platform ON watches(platform);
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS role_id TEXT;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS seen_post_ids JSONB NOT NULL DEFAULT '[]';
+    `);
+    // Backfill seen_post_ids for existing rows so nothing re-fires after migration
+    await pool.query(`
+        UPDATE watches
+        SET seen_post_ids = jsonb_build_array(last_post_id)
+        WHERE last_post_id IS NOT NULL AND seen_post_ids = '[]'::jsonb
     `);
 }
 
@@ -114,8 +121,13 @@ async function getWatch(guildId, id) {
     const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 AND id = $2', [guildId, id]);
     return res.rows[0] || null;
 }
-async function updateLastPost(id, lastPostId) {
-    await pool.query('UPDATE watches SET last_post_id = $1, last_checked = $2 WHERE id = $3', [lastPostId, Date.now(), id]);
+const SEEN_HISTORY_SIZE = 20;
+async function updateLastPost(id, lastPostId, seenIds = []) {
+    const updated = [...new Set([lastPostId, ...seenIds])].slice(0, SEEN_HISTORY_SIZE);
+    await pool.query(
+        'UPDATE watches SET last_post_id = $1, last_checked = $2, seen_post_ids = $3 WHERE id = $4',
+        [lastPostId, Date.now(), JSON.stringify(updated), id]
+    );
 }
 async function touchLastChecked(id) {
     await pool.query('UPDATE watches SET last_checked = $1 WHERE id = $2', [Date.now(), id]);
@@ -371,13 +383,14 @@ async function pollAll() {
             try {
                 const post = await fetchLatestPost(w.platform, w.handle);
                 if (!post || !post.id) { await touchLastChecked(w.id); continue; }
+                const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
                 if (w.last_post_id === null) {
                     // First check — just record current latest, don't spam old content
-                    await updateLastPost(w.id, post.id);
+                    await updateLastPost(w.id, post.id, seenIds);
                     continue;
                 }
-                if (post.id === w.last_post_id) { await touchLastChecked(w.id); continue; }
-                await updateLastPost(w.id, post.id);
+                if (seenIds.includes(post.id)) { await touchLastChecked(w.id); continue; }
+                await updateLastPost(w.id, post.id, seenIds);
                 const guild = client.guilds.cache.get(w.guild_id);
                 const channel = guild?.channels.cache.get(w.channel_id);
                 if (!channel) continue;
@@ -471,7 +484,7 @@ const helpEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Social 
         { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
         { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
         { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
-        { name: 'Notes', value: 'Checks run every 5 minutes. New watches start tracking from the next post onward (no notification for existing content). TikTok/Instagram/Twitter rely on unofficial scraping and may occasionally fail or lag.' },
+        { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). TikTok/Instagram/Twitter rely on unofficial scraping and may occasionally fail or lag.' },
     );
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
@@ -610,7 +623,8 @@ client.on('interactionCreate', async interaction => {
 
                 const embed = E('#5865F2', `Debug — ${PLATFORMS[w.platform].label} ${w.handle}`)
                     .addFields(
-                        { name: 'Stored baseline (last_post_id)', value: w.last_post_id ? `\`${w.last_post_id}\`` : '*(none yet)*' },
+                        { name: 'Most recent post ID', value: w.last_post_id ? `\`${w.last_post_id}\`` : '*(none yet)*' },
+                        { name: 'Recently seen IDs', value: Array.isArray(w.seen_post_ids) && w.seen_post_ids.length ? w.seen_post_ids.slice(0, 10).map(id => `\`${id}\``).join(', ') : '*(none yet)*' },
                         { name: 'Last checked', value: w.last_checked ? `<t:${Math.floor(w.last_checked / 1000)}:R>` : '*(never)*' },
                     );
                 if (fetchError) {
@@ -618,9 +632,10 @@ client.on('interactionCreate', async interaction => {
                 } else if (!post) {
                     embed.addFields({ name: 'Live fetch', value: '⚠️ Returned no post (account empty or unparsable).' });
                 } else {
+                    const alreadySeen = Array.isArray(w.seen_post_ids) && w.seen_post_ids.includes(post.id);
                     embed.addFields(
                         { name: 'Live fetch — latest post ID', value: `\`${post.id}\`` },
-                        { name: 'Matches baseline?', value: post.id === w.last_post_id ? '✅ Yes — no notification will fire' : '🆕 Different — notification should fire on next poll/check' },
+                        { name: 'Already notified for this?', value: alreadySeen ? '✅ Yes — no notification will fire' : '🆕 New — notification should fire on next poll/check' },
                         { name: 'Live post', value: post.title ? `[${post.title.slice(0, 150)}](${post.url})` : (post.url || 'N/A') },
                     );
                 }
