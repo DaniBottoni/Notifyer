@@ -16,6 +16,7 @@ async function ensureIPv4Pool() {
     if (!process.env.DATABASE_URL) return;
     try {
         const url = new URL(process.env.DATABASE_URL);
+        console.log(`🔍 DB host from DATABASE_URL: ${url.hostname}:${url.port || 5432}`);
         const { address } = await new Promise((resolve, reject) =>
             dns.lookup(url.hostname, { family: 4 }, (err, address, family) => err ? reject(err) : resolve({ address, family }))
         );
@@ -84,6 +85,45 @@ async function getConfig(guildId) {
 function saveConfig(guildId, data) {
     configCache.set(guildId, data);
     pool.query('INSERT INTO configs (guild_id, data) VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET data = $2', [guildId, data]).catch(e => console.error('saveConfig:', e.message));
+}
+
+const SUPPORT_SERVER_URL = 'https://discord.gg/CmNjecb82Y';
+
+// Finds an admin-only channel to post in: a text channel the bot can send in,
+// where @everyone does NOT have ViewChannel (i.e. it's restricted), preferring
+// names containing "admin"/"staff"/"mod". Falls back to the first postable channel.
+function findAnnouncementChannel(guild) {
+    const me = guild.members.me;
+    if (!me) return null;
+    const textChannels = guild.channels.cache.filter(c =>
+        (c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement) &&
+        c.permissionsFor(me)?.has(PermissionFlagsBits.SendMessages) &&
+        c.permissionsFor(me)?.has(PermissionFlagsBits.ViewChannel)
+    );
+    if (!textChannels.size) return null;
+
+    const everyoneRole = guild.roles.everyone;
+    const restricted = textChannels.filter(c => !c.permissionsFor(everyoneRole)?.has(PermissionFlagsBits.ViewChannel));
+    if (restricted.size) {
+        const named = restricted.find(c => /admin|staff|mod|owner/i.test(c.name));
+        return named || restricted.first();
+    }
+    // No restricted channel found — fall back to first available postable channel
+    const named = textChannels.find(c => /admin|staff|mod|owner|general/i.test(c.name));
+    return named || textChannels.first();
+}
+
+async function announceSupportServer(guild) {
+    try {
+        const channel = findAnnouncementChannel(guild);
+        if (!channel) return;
+        const embed = new EmbedBuilder().setColor('#5865F2').setTitle('👋 Thanks for using Notifyer!')
+            .setDescription(`Join the support server for help, updates, and to report issues:\n${SUPPORT_SERVER_URL}`);
+        await channel.send({ embeds: [embed] });
+        console.log(`📨 Sent support server announcement to ${guild.name} (#${channel.name})`);
+    } catch (e) {
+        console.error(`announceSupportServer (${guild.id}):`, e.message);
+    }
 }
 
 async function getWatches(guildId) {
@@ -278,24 +318,33 @@ async function fetchLatestTwitter(handle) {
 async function fetchLatestTikTok(handle) {
     const html = await fetchText(`https://www.tiktok.com/@${handle}`);
     const m = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)<\/script>/s);
-    if (!m) throw new Error('Could not parse TikTok page');
-    const data = JSON.parse(m[1]);
-    const itemList = data?.__DEFAULT_SCOPE__?.['webapp.user-detail']?.userInfo?.user;
-    const items = data?.__DEFAULT_SCOPE__?.['webapp.user-detail']?.itemList
+    if (!m) throw new Error('TikTok page structure changed: __UNIVERSAL_DATA_FOR_REHYDRATION__ script tag not found');
+    let data;
+    try { data = JSON.parse(m[1]); }
+    catch (e) { throw new Error(`TikTok page JSON parse failed: ${e.message}`); }
+
+    const userInfo = data?.__DEFAULT_SCOPE__?.['webapp.user-detail']?.userInfo?.user;
+    let videos = data?.__DEFAULT_SCOPE__?.['webapp.user-detail']?.itemList
         || data?.__DEFAULT_SCOPE__?.['webapp.user-detail']?.userInfo?.itemList;
-    // Fallback: search for the items module structure
-    let videos = items;
+
     if (!videos) {
         const moduleM = html.match(/"itemList":(\[.*?\]),"webapp\.video-detail"/s);
-        if (moduleM) videos = JSON.parse(moduleM[1]);
+        if (moduleM) {
+            try { videos = JSON.parse(moduleM[1]); }
+            catch (e) { throw new Error(`TikTok itemList JSON parse failed: ${e.message}`); }
+        }
     }
-    if (!videos || !videos.length) return null;
+
+    if (!videos) throw new Error('TikTok page structure changed: could not locate itemList in page data (account may be private, empty, or TikTok updated their page format)');
+    if (!videos.length) throw new Error('TikTok itemList found but is empty (account may have no public videos)');
+
     const v = videos[0];
+    if (!v?.id) throw new Error('TikTok video entry missing an id field — page format may have changed');
     return {
         id: v.id,
         url: `https://www.tiktok.com/@${handle}/video/${v.id}`,
         title: v.desc || `New TikTok from @${handle}`,
-        author: itemList?.nickname || handle,
+        author: userInfo?.nickname || handle,
         thumbnail: v.video?.cover || v.video?.dynamicCover,
         timestamp: v.createTime ? new Date(v.createTime * 1000).toISOString() : null,
     };
@@ -303,15 +352,11 @@ async function fetchLatestTikTok(handle) {
 
 async function fetchLatestInstagram(handle) {
     const html = await fetchText(`https://www.instagram.com/${handle}/`);
-    const m = html.match(/<script type="application\/ld\+json"[^>]*>(.*?)<\/script>/s);
-    let post = null;
-    if (m) {
-        try {
-            const ld = JSON.parse(m[1]);
-            const main = Array.isArray(ld) ? ld[0] : ld;
-            // ld+json structured data sometimes includes mainEntityofPage / image but rarely the latest post directly
-        } catch {}
+
+    if (/Log in to Instagram|loginForm|"require_login"\s*:\s*true/i.test(html) && !/"edge_owner_to_timeline_media"/i.test(html)) {
+        throw new Error('Instagram returned a login wall for this request — logged-out scraping appears to be blocked for this account/IP right now');
     }
+
     // Primary path: shared data with edge_owner_to_timeline_media
     const sharedM = html.match(/window\.__additionalDataLoaded\([^,]+,(\{.*?\})\);/s) || html.match(/"PolarisProfilePage[^"]*"[^]*?"edges":(\[.*?\])\s*,\s*"page_info"/s);
     let edges = null;
@@ -319,14 +364,17 @@ async function fetchLatestInstagram(handle) {
         try {
             const parsed = JSON.parse(sharedM[1]);
             edges = parsed?.graphql?.user?.edge_owner_to_timeline_media?.edges || parsed;
-        } catch {}
+        } catch (e) {
+            throw new Error(`Instagram shared-data JSON parse failed: ${e.message}`);
+        }
     }
+
     if (!edges) {
         // Fallback regex: grab the first shortcode + caption + display_url near top of page data
         const scMatch = html.match(/"shortcode":"([^"]+)"/);
         const capMatch = html.match(/"edge_media_to_caption":\{"edges":\[\{"node":\{"text":"((?:[^"\\]|\\.)*)"/);
         const imgMatch = html.match(/"display_url":"((?:[^"\\]|\\.)*)"/);
-        if (!scMatch) return null;
+        if (!scMatch) throw new Error('Instagram page structure changed: no post data found (shortcode/edges missing — page may be a login wall, private account, or Instagram updated their format)');
         return {
             id: scMatch[1],
             url: `https://www.instagram.com/p/${scMatch[1]}/`,
@@ -338,7 +386,7 @@ async function fetchLatestInstagram(handle) {
     }
     const first = Array.isArray(edges) ? edges[0] : edges?.[0];
     const node = first?.node;
-    if (!node) return null;
+    if (!node) throw new Error('Instagram edges array found but contained no usable post node (account may have no posts)');
     return {
         id: node.shortcode,
         url: `https://www.instagram.com/p/${node.shortcode}/`,
@@ -514,6 +562,32 @@ client.once('ready', async () => {
     // Start polling
     pollAll().catch(e => console.error('initial poll:', e.message));
     setInterval(() => pollAll().catch(e => console.error('poll loop:', e.message)), POLL_INTERVAL_MS);
+
+    // Announce the support server to existing guilds, once each.
+    for (const guild of client.guilds.cache.values()) {
+        try {
+            const cfg = await getConfig(guild.id);
+            if (cfg.supportAnnounced) continue;
+            await announceSupportServer(guild);
+            cfg.supportAnnounced = true;
+            saveConfig(guild.id, cfg);
+        } catch (e) {
+            console.error(`support announce (${guild.id}):`, e.message);
+        }
+        await new Promise(r => setTimeout(r, 1000)); // light stagger to avoid rate limits
+    }
+});
+
+client.on('guildCreate', async (guild) => {
+    try {
+        const cfg = await getConfig(guild.id);
+        if (cfg.supportAnnounced) return;
+        await announceSupportServer(guild);
+        cfg.supportAnnounced = true;
+        saveConfig(guild.id, cfg);
+    } catch (e) {
+        console.error(`guildCreate announce (${guild.id}):`, e.message);
+    }
 });
 
 // ── Interaction handling ────────────────────────────────────────────────────
