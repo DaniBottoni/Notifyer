@@ -351,13 +351,61 @@ async function fetchLatestTikTok(handle) {
 }
 
 async function fetchLatestInstagram(handle) {
+    const sessionId = process.env.IG_SESSION_ID;
+
+    if (sessionId) {
+        // Authenticated path: use Instagram's own internal web API, which
+        // returns clean JSON and works far more reliably than scraping HTML
+        // since Instagram restricts what logged-out requests can see.
+        const cookie = [
+            `sessionid=${sessionId}`,
+            process.env.IG_CSRF_TOKEN ? `csrftoken=${process.env.IG_CSRF_TOKEN}` : null,
+            process.env.IG_DS_USER_ID ? `ds_user_id=${process.env.IG_DS_USER_ID}` : null,
+        ].filter(Boolean).join('; ');
+
+        let json;
+        try {
+            const raw = await fetchText(
+                `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(handle)}`,
+                {
+                    'Cookie': cookie,
+                    'X-IG-App-ID': '936619743392459', // public web app ID used by instagram.com itself
+                    'Accept': 'application/json',
+                    'Referer': `https://www.instagram.com/${handle}/`,
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                }
+            );
+            json = JSON.parse(raw);
+        } catch (e) {
+            if (/HTTP 401|HTTP 403/.test(e.message)) {
+                throw new Error('Instagram session cookie appears to be expired or invalid (401/403) — please refresh IG_SESSION_ID');
+            }
+            throw new Error(`Instagram API request failed: ${e.message}`);
+        }
+
+        const user = json?.data?.user;
+        if (!user) throw new Error('Instagram API returned no user data — account may not exist, may be private and inaccessible to this session, or the session cookie is invalid');
+        const edges = user.edge_owner_to_timeline_media?.edges;
+        if (!edges || !edges.length) throw new Error('Instagram account has no public posts, or this session cannot view its posts');
+        const node = edges[0].node;
+        return {
+            id: node.shortcode,
+            url: `https://www.instagram.com/p/${node.shortcode}/`,
+            title: node.edge_media_to_caption?.edges?.[0]?.node?.text?.slice(0, 200) || `New Instagram post from @${handle}`,
+            author: user.full_name || handle,
+            thumbnail: node.display_url || node.thumbnail_src,
+            timestamp: node.taken_at_timestamp ? new Date(node.taken_at_timestamp * 1000).toISOString() : null,
+        };
+    }
+
+    // Fallback: unauthenticated HTML scraping (unreliable — Instagram
+    // increasingly blocks logged-out requests from seeing post data).
     const html = await fetchText(`https://www.instagram.com/${handle}/`);
 
     if (/Log in to Instagram|loginForm|"require_login"\s*:\s*true/i.test(html) && !/"edge_owner_to_timeline_media"/i.test(html)) {
-        throw new Error('Instagram returned a login wall for this request — logged-out scraping appears to be blocked for this account/IP right now');
+        throw new Error('Instagram returned a login wall for this request (no IG_SESSION_ID configured) — set IG_SESSION_ID for reliable access');
     }
 
-    // Primary path: shared data with edge_owner_to_timeline_media
     const sharedM = html.match(/window\.__additionalDataLoaded\([^,]+,(\{.*?\})\);/s) || html.match(/"PolarisProfilePage[^"]*"[^]*?"edges":(\[.*?\])\s*,\s*"page_info"/s);
     let edges = null;
     if (sharedM) {
@@ -370,11 +418,10 @@ async function fetchLatestInstagram(handle) {
     }
 
     if (!edges) {
-        // Fallback regex: grab the first shortcode + caption + display_url near top of page data
         const scMatch = html.match(/"shortcode":"([^"]+)"/);
         const capMatch = html.match(/"edge_media_to_caption":\{"edges":\[\{"node":\{"text":"((?:[^"\\]|\\.)*)"/);
         const imgMatch = html.match(/"display_url":"((?:[^"\\]|\\.)*)"/);
-        if (!scMatch) throw new Error('Instagram page structure changed: no post data found (shortcode/edges missing — page may be a login wall, private account, or Instagram updated their format)');
+        if (!scMatch) throw new Error('Instagram page structure changed: no post data found (shortcode/edges missing — set IG_SESSION_ID for reliable access, or Instagram updated their format)');
         return {
             id: scMatch[1],
             url: `https://www.instagram.com/p/${scMatch[1]}/`,
