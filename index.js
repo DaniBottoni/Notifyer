@@ -40,8 +40,6 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 const PLATFORMS = {
     youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
     twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
-    tiktok:    { label: 'TikTok',    emoji: '🎵', color: '#000000' },
-    instagram: { label: 'Instagram', emoji: '📸', color: '#E1306C' },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF' },
 };
 
@@ -54,14 +52,6 @@ const PLATFORM_NOTIFY_TYPES = {
         { id: 'live',   label: 'Live',    description: 'Stream goes live' },
     ],
     twitter:   [{ id: 'posts', label: 'Posts', description: 'New tweets/posts' }],
-    tiktok:    [
-        { id: 'videos', label: 'Videos', description: 'New TikTok videos' },
-        { id: 'live',   label: 'Live',   description: 'Stream goes live (best-effort)' },
-    ],
-    instagram: [
-        { id: 'posts',  label: 'Posts',  description: 'Photos and carousels' },
-        { id: 'reels',  label: 'Reels',  description: 'Short video Reels' },
-    ],
     twitch:    [
         { id: 'live',   label: 'Live',   description: 'Stream goes live' },
         { id: 'vods',   label: 'VODs',   description: 'New VOD/past broadcast uploaded' },
@@ -205,20 +195,6 @@ async function touchLastChecked(id) {
 // ── Helpers ────────────────────────────────────────────────────────────────
 const E = (c, t) => new EmbedBuilder().setColor(c).setTitle(t).setTimestamp();
 
-// Parse IG_PROXIES env var: "user:pass@host:port,user:pass@host:port,..."
-function parseProxies() {
-    const raw = process.env.IG_PROXIES || '';
-    if (!raw.trim()) return [];
-    return raw.split(',').map(s => {
-        s = s.trim();
-        const m = s.match(/^([^:]+):([^@]+)@([^:]+):(\d+)$/);
-        if (!m) { console.warn('⚠️ Could not parse proxy entry:', s); return null; }
-        return { user: m[1], pass: m[2], host: m[3], port: parseInt(m[4]) };
-    }).filter(Boolean);
-}
-const PROXIES = parseProxies();
-let proxyIndex = 0; // round-robin pointer
-
 function fetchText(url, headers = {}) {
     return new Promise((resolve, reject) => {
         const mod = url.startsWith('https') ? https : http;
@@ -234,97 +210,6 @@ function fetchText(url, headers = {}) {
     });
 }
 
-// Fetch via an HTTP CONNECT proxy tunnel (works for both http and https targets)
-function fetchTextViaProxy(url, proxy, headers = {}) {
-    return new Promise((resolve, reject) => {
-        const targetUrl = new URL(url);
-        const isHttps = targetUrl.protocol === 'https:';
-        const targetHost = targetUrl.hostname;
-        const targetPort = parseInt(targetUrl.port) || (isHttps ? 443 : 80);
-        const auth = Buffer.from(`${proxy.user}:${proxy.pass}`).toString('base64');
-
-        // Open TCP connection to proxy
-        const socket = require('net').createConnection(proxy.port, proxy.host, () => {
-            // Send HTTP CONNECT to tunnel to target
-            socket.write(
-                `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
-                `Host: ${targetHost}:${targetPort}\r\n` +
-                `Proxy-Authorization: Basic ${auth}\r\n` +
-                `\r\n`
-            );
-        });
-        socket.setTimeout(15000, () => socket.destroy(new Error('Proxy connect timeout')));
-        socket.once('error', reject);
-
-        let headerBuf = '';
-        socket.once('data', chunk => {
-            headerBuf += chunk.toString();
-            if (!headerBuf.includes('\r\n\r\n')) return; // wait for full response header
-            if (!headerBuf.startsWith('HTTP/1.1 200') && !headerBuf.startsWith('HTTP/1.0 200')) {
-                const status = headerBuf.split('\r\n')[0];
-                socket.destroy();
-                return reject(new Error(`Proxy CONNECT failed: ${status}`));
-            }
-            // Tunnel established — wrap in TLS if needed and make the real request
-            const makeRequest = (s) => {
-                const mod = isHttps ? https : http;
-                const path = targetUrl.pathname + targetUrl.search;
-                const reqHeaders = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                    'Host': targetHost,
-                    ...headers,
-                };
-                const req = mod.request({
-                    method: 'GET', path, headers: reqHeaders,
-                    createConnection: () => s,
-                    ...(isHttps ? { servername: targetHost } : {}),
-                }, res => {
-                    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                        socket.destroy();
-                        return fetchText(res.headers.location, headers).then(resolve, reject);
-                    }
-                    if (res.statusCode !== 200) {
-                        socket.destroy();
-                        return reject(new Error(`HTTP ${res.statusCode}`));
-                    }
-                    const chunks = [];
-                    res.on('data', c => chunks.push(c));
-                    res.on('end', () => { resolve(Buffer.concat(chunks).toString('utf8')); socket.destroy(); });
-                    res.on('error', e => { socket.destroy(); reject(e); });
-                });
-                req.on('error', e => { socket.destroy(); reject(e); });
-                req.end();
-            };
-
-            if (isHttps) {
-                const tlsSocket = require('tls').connect({ socket, servername: targetHost, rejectUnauthorized: false }, () => makeRequest(tlsSocket));
-                tlsSocket.on('error', e => { socket.destroy(); reject(e); });
-            } else {
-                makeRequest(socket);
-            }
-        });
-    });
-}
-
-// Try each proxy in round-robin order, then fall back to direct if all fail
-async function fetchTextProxied(url, headers = {}) {
-    if (!PROXIES.length) return fetchText(url, headers);
-    const attempts = PROXIES.length;
-    for (let i = 0; i < attempts; i++) {
-        const proxy = PROXIES[(proxyIndex + i) % PROXIES.length];
-        try {
-            const result = await fetchTextViaProxy(url, proxy, headers);
-            proxyIndex = (proxyIndex + i) % PROXIES.length; // stick with working proxy
-            return result;
-        } catch (e) {
-            console.warn(`⚠️ Proxy ${proxy.host}:${proxy.port} failed (${e.message}), trying next…`);
-        }
-    }
-    // All proxies failed — advance index for next time and try direct as last resort
-    proxyIndex = (proxyIndex + 1) % PROXIES.length;
-    console.warn('⚠️ All proxies failed, falling back to direct connection');
-    return fetchText(url, headers);
-}
 async function hasCommandPermission(interaction, guildId) {
     if (interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return true;
     const cfg = await getConfig(guildId);
@@ -343,14 +228,6 @@ function normalizeHandle(platform, raw) {
         h = h.replace(/^(twitter\.com|x\.com)\//i, '');
         h = h.replace(/^@/, '');
         h = h.split(/[/?]/)[0];
-    } else if (platform === 'tiktok') {
-        h = h.replace(/^tiktok\.com\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0];
-    } else if (platform === 'instagram') {
-        h = h.replace(/^instagram\.com\//i, '');
-        h = h.replace(/^@/, '');
-        h = h.split(/[/?]/)[0];
     } else if (platform === 'twitch') {
         h = h.replace(/^twitch\.tv\//i, '');
         h = h.replace(/^@/, '');
@@ -362,8 +239,6 @@ function profileUrl(platform, handle) {
     switch (platform) {
         case 'youtube': return handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/channel/${handle}`;
         case 'twitter': return `https://x.com/${handle}`;
-        case 'tiktok': return `https://www.tiktok.com/@${handle}`;
-        case 'instagram': return `https://www.instagram.com/${handle}`;
         case 'twitch': return `https://www.twitch.tv/${handle}`;
     }
 }
@@ -458,149 +333,6 @@ async function fetchLatestTwitter(handle) {
     delete best.idNum;
     delete best.source;
     return best;
-}
-
-async function fetchLatestTikTok(handle) {
-    const html = await fetchTextProxied(`https://www.tiktok.com/@${handle}`);
-    const m = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)<\/script>/s);
-    if (!m) throw new Error('TikTok page structure changed: __UNIVERSAL_DATA_FOR_REHYDRATION__ script tag not found');
-    let data;
-    try { data = JSON.parse(m[1]); }
-    catch (e) { throw new Error(`TikTok page JSON parse failed: ${e.message}`); }
-
-    const userInfo = data?.__DEFAULT_SCOPE__?.['webapp.user-detail']?.userInfo?.user;
-    let videos = data?.__DEFAULT_SCOPE__?.['webapp.user-detail']?.itemList
-        || data?.__DEFAULT_SCOPE__?.['webapp.user-detail']?.userInfo?.itemList;
-
-    if (!videos) {
-        const moduleM = html.match(/"itemList":(\[.*?\]),"webapp\.video-detail"/s);
-        if (moduleM) {
-            try { videos = JSON.parse(moduleM[1]); }
-            catch (e) { throw new Error(`TikTok itemList JSON parse failed: ${e.message}`); }
-        }
-    }
-
-    if (!videos) throw new Error('TikTok page structure changed: could not locate itemList in page data (account may be private, empty, or TikTok updated their page format)');
-    if (!videos.length) throw new Error('TikTok itemList found but is empty (account may have no public videos)');
-
-    const v = videos[0];
-    if (!v?.id) throw new Error('TikTok video entry missing an id field — page format may have changed');
-    return {
-        id: v.id,
-        url: `https://www.tiktok.com/@${handle}/video/${v.id}`,
-        title: v.desc || `New TikTok from @${handle}`,
-        author: userInfo?.nickname || handle,
-        thumbnail: v.video?.cover || v.video?.dynamicCover,
-        timestamp: v.createTime ? new Date(v.createTime * 1000).toISOString() : null,
-        postType: 'videos',
-    };
-}
-
-async function fetchLatestInstagram(handle) {
-    const sessionId = process.env.IG_SESSION_ID;
-
-    if (sessionId) {
-        // Authenticated path: use Instagram's own internal web API, which
-        // returns clean JSON and works far more reliably than scraping HTML
-        // since Instagram restricts what logged-out requests can see.
-        const cookie = [
-            `sessionid=${sessionId}`,
-            process.env.IG_CSRF_TOKEN ? `csrftoken=${process.env.IG_CSRF_TOKEN}` : null,
-            process.env.IG_DS_USER_ID ? `ds_user_id=${process.env.IG_DS_USER_ID}` : null,
-        ].filter(Boolean).join('; ');
-
-        let json;
-        try {
-            const raw = await fetchTextProxied(
-                `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(handle)}`,
-                {
-                    'Cookie': cookie,
-                    'X-IG-App-ID': '936619743392459',
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'Accept': '*/*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Referer': `https://www.instagram.com/${handle}/`,
-                    'Origin': 'https://www.instagram.com',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-                    'sec-ch-ua': '"Chromium";v="125", "Not.A/Brand";v="24"',
-                    'sec-ch-ua-mobile': '?0',
-                    'sec-ch-ua-platform': '"Windows"',
-                    'sec-fetch-dest': 'empty',
-                    'sec-fetch-mode': 'cors',
-                    'sec-fetch-site': 'same-origin',
-                }
-            );
-            json = JSON.parse(raw);
-        } catch (e) {
-            if (/HTTP 429/.test(e.message)) throw new Error('HTTP 429'); // let pollAll handle as rate-limit
-            if (/HTTP 401|HTTP 403/.test(e.message)) throw new Error('Instagram session cookie appears to be expired or invalid — please refresh IG_SESSION_ID in Render env vars');
-            throw new Error(`Instagram API request failed: ${e.message}`);
-        }
-
-        const user = json?.data?.user;
-        if (!user) throw new Error('Instagram API returned no user data — account may not exist, be private, or the session cookie is invalid');
-        const edges = user.edge_owner_to_timeline_media?.edges;
-        if (!edges || !edges.length) throw new Error('Instagram account has no public posts, or this session cannot view its posts');
-        const node = edges[0].node;
-        const postType = (node.is_video && node.product_type === 'clips') ? 'reels' : 'posts';
-        return {
-            id: node.shortcode,
-            url: `https://www.instagram.com/p/${node.shortcode}/`,
-            title: node.edge_media_to_caption?.edges?.[0]?.node?.text?.slice(0, 200) || `New Instagram post from @${handle}`,
-            author: user.full_name || handle,
-            thumbnail: node.display_url || node.thumbnail_src,
-            timestamp: node.taken_at_timestamp ? new Date(node.taken_at_timestamp * 1000).toISOString() : null,
-            postType,
-        };
-    }
-
-    // Fallback: unauthenticated HTML scraping (unreliable — Instagram
-    // increasingly blocks logged-out requests from seeing post data).
-    const html = await fetchTextProxied(`https://www.instagram.com/${handle}/`);
-
-    if (/Log in to Instagram|loginForm|"require_login"\s*:\s*true/i.test(html) && !/"edge_owner_to_timeline_media"/i.test(html)) {
-        throw new Error('Instagram returned a login wall for this request (no IG_SESSION_ID configured) — set IG_SESSION_ID for reliable access');
-    }
-
-    const sharedM = html.match(/window\.__additionalDataLoaded\([^,]+,(\{.*?\})\);/s) || html.match(/"PolarisProfilePage[^"]*"[^]*?"edges":(\[.*?\])\s*,\s*"page_info"/s);
-    let edges = null;
-    if (sharedM) {
-        try {
-            const parsed = JSON.parse(sharedM[1]);
-            edges = parsed?.graphql?.user?.edge_owner_to_timeline_media?.edges || parsed;
-        } catch (e) {
-            throw new Error(`Instagram shared-data JSON parse failed: ${e.message}`);
-        }
-    }
-
-    if (!edges) {
-        const scMatch = html.match(/"shortcode":"([^"]+)"/);
-        const capMatch = html.match(/"edge_media_to_caption":\{"edges":\[\{"node":\{"text":"((?:[^"\\]|\\.)*)"/);
-        const imgMatch = html.match(/"display_url":"((?:[^"\\]|\\.)*)"/);
-        if (!scMatch) throw new Error('Instagram page structure changed: no post data found (shortcode/edges missing — set IG_SESSION_ID for reliable access, or Instagram updated their format)');
-        return {
-            id: scMatch[1],
-            url: `https://www.instagram.com/p/${scMatch[1]}/`,
-            title: capMatch ? JSON.parse(`"${capMatch[1]}"`).slice(0, 200) : `New Instagram post from @${handle}`,
-            author: handle,
-            thumbnail: imgMatch ? JSON.parse(`"${imgMatch[1]}"`) : null,
-            timestamp: null,
-            postType: 'posts',
-        };
-    }
-    const first = Array.isArray(edges) ? edges[0] : edges?.[0];
-    const node = first?.node;
-    if (!node) throw new Error('Instagram edges array found but contained no usable post node (account may have no posts)');
-    const postType = (node.is_video && node.product_type === 'clips') ? 'reels' : 'posts';
-    return {
-        id: node.shortcode,
-        url: `https://www.instagram.com/p/${node.shortcode}/`,
-        title: node.edge_media_to_caption?.edges?.[0]?.node?.text?.slice(0, 200) || `New Instagram post from @${handle}`,
-        author: handle,
-        thumbnail: node.display_url || node.thumbnail_src,
-        timestamp: node.taken_at_timestamp ? new Date(node.taken_at_timestamp * 1000).toISOString() : null,
-        postType,
-    };
 }
 
 // ── Twitch OAuth token management ─────────────────────────────────────────
@@ -707,8 +439,6 @@ async function fetchLatestPost(platform, handle) {
     switch (platform) {
         case 'youtube': return fetchLatestYouTube(handle);
         case 'twitter': return fetchLatestTwitter(handle);
-        case 'tiktok': return fetchLatestTikTok(handle);
-        case 'instagram': return fetchLatestInstagram(handle);
         case 'twitch': return null; // Twitch uses fetchLatestTwitchAll — handled separately in pollAll
         default: return null;
     }
@@ -727,9 +457,7 @@ function renderTemplate(template, post, platform, handle) {
 }
 
 // ── Polling loop ───────────────────────────────────────────────────────────
-const PLATFORM_MIN_INTERVAL_MS = {
-    instagram: 15 * 60 * 1000, // Instagram rate-limits aggressively — poll conservatively
-};
+const PLATFORM_MIN_INTERVAL_MS = {};
 
 function shouldNotify(w, post) {
     const types = Array.isArray(w.notify_types) && w.notify_types.length ? w.notify_types : null;
@@ -813,8 +541,8 @@ async function pollAll() {
                 }
                 await touchLastChecked(w.id).catch(() => {});
             }
-            // Stagger with jitter — Instagram especially benefits from non-predictable timing
-            const jitter = w.platform === 'instagram' ? 2000 + Math.random() * 3000 : 1000 + Math.random() * 1000;
+            // Stagger with jitter to avoid hammering platforms all at once
+            const jitter = 1000 + Math.random() * 1000;
             await new Promise(r => setTimeout(r, jitter));
         }
     } finally {
@@ -889,7 +617,7 @@ const helpEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Social 
         { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
         { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
         { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
-        { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). TikTok/Instagram/Twitter rely on unofficial scraping and may occasionally fail or lag.' },
+        { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
     );
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
@@ -1002,31 +730,20 @@ client.on('interactionCreate', async interaction => {
                 }
                 if (watches.length >= 50) return interaction.editReply('❌ This server has reached the maximum of 50 tracked accounts.');
 
-                // Instagram and TikTok are skipped here — their anti-bot measures
-                // block verification requests; the first poll will confirm within a few minutes.
                 let post = null;
-                if (platform === 'instagram') {
-                    if (!/^[a-zA-Z0-9._]{1,30}$/.test(handle)) return interaction.editReply('❌ That doesn\'t look like a valid Instagram handle.');
-                } else if (platform === 'tiktok') {
-                    if (!/^[a-zA-Z0-9._]{1,24}$/.test(handle)) return interaction.editReply('❌ That doesn\'t look like a valid TikTok handle.');
-                } else {
-                    try {
-                        if (platform === 'twitch') {
-                            const posts = await fetchLatestTwitchAll(handle);
-                            post = posts[0] || null;
-                        } else {
-                            post = await fetchLatestPost(platform, handle);
-                        }
-                    } catch (e) {
-                        if (/HTTP 429/.test(e.message)) {
-                            // Rate-limited on verify — account likely exists, proceed anyway
-                            post = null;
-                        } else {
-                            return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}\nDouble-check the handle/URL and try again.`);
-                        }
+                try {
+                    if (platform === 'twitch') {
+                        const posts = await fetchLatestTwitchAll(handle);
+                        post = posts[0] || null;
+                    } else {
+                        post = await fetchLatestPost(platform, handle);
                     }
-                    if (post === null && platform !== 'twitch') {
-                        // Don't block adding — account may just have no posts yet
+                } catch (e) {
+                    if (/HTTP 429/.test(e.message)) {
+                        // Rate-limited on verify — account likely exists, proceed anyway
+                        post = null;
+                    } else {
+                        return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}\nDouble-check the handle/URL and try again.`);
                     }
                 }
 
@@ -1041,11 +758,9 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Account', value: handle, inline: true },
                     { name: 'Channel', value: `${channel}`, inline: true },
                     { name: 'Message', value: message || DEFAULT_TEMPLATE },
-                    platform === 'instagram' || platform === 'tiktok'
-                        ? { name: 'Baseline', value: `⏳ ${PLATFORMS[platform].label} verification skipped to avoid rate limits — will baseline on first poll.` }
-                        : post?.title
-                            ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }
-                            : { name: 'Baseline', value: 'No posts found yet — will track from first post.' },
+                    post?.title
+                        ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }
+                        : { name: 'Baseline', value: 'No posts found yet — will track from first post.' },
                 );
 
                 // If platform only has one type, skip the selector
