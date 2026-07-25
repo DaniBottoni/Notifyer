@@ -895,7 +895,7 @@ const helpEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Social 
 // ── Bot ready ──────────────────────────────────────────────────────────────
 client.once('ready', async () => {
     console.log(`✅ Social notify bot online as ${client.user.tag}`);
-    client.user.setPresence({ activities: [{ name: 'social media for new posts', type: ActivityType.Watching }], status: 'online' });
+    client.user.setPresence({ activities: [{ name: 'Redreshing social media for new posts', type: ActivityType.Watching }], status: 'online' });
     const commands = [
         new SlashCommandBuilder().setName('invite').setDescription('Get a link to invite this bot to another server'),
         new SlashCommandBuilder().setName('help').setDescription('View commands and features'),
