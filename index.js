@@ -335,17 +335,27 @@ async function fetchLatestTwitter(handle) {
     return best;
 }
 
+
+
+async function fetchTwitch(path) {
+    const clientId = process.env.TWITCH_CLIENT_ID;
+    if (!clientId) throw new Error('TWITCH_CLIENT_ID env var not set');
+    const token = await getTwitchToken();
+    const raw = await fetchText(`https://api.twitch.tv/helix/${path}`, {
+        'Client-Id': clientId,
+        'Authorization': `Bearer ${token}`,
+    });
+    return JSON.parse(raw);
+}
+
 // ── Twitch OAuth token management ─────────────────────────────────────────
 let twitchToken = null, twitchTokenExpiry = 0;
 async function getTwitchToken() {
     if (twitchToken && Date.now() < twitchTokenExpiry - 60_000) return twitchToken;
     const clientId = process.env.TWITCH_CLIENT_ID, clientSecret = process.env.TWITCH_CLIENT_SECRET;
     if (!clientId || !clientSecret) throw new Error('TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET env vars not set');
-    const raw = await fetchText(
-        `https://id.twitch.tv/oauth2/token?client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`,
-        { 'Content-Type': 'application/x-www-form-urlencoded' }
-    );
-    // fetchText uses GET, but Twitch token endpoint needs POST — use https directly
+
+    // Twitch's token endpoint requires POST, so we can't use fetchText (GET-only) here.
     const res = await new Promise((resolve, reject) => {
         const body = `client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`;
         const req = https.request('https://id.twitch.tv/oauth2/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, res => {
@@ -357,17 +367,6 @@ async function getTwitchToken() {
     twitchToken = res.access_token;
     twitchTokenExpiry = Date.now() + (res.expires_in * 1000);
     return twitchToken;
-}
-
-async function fetchTwitch(path) {
-    const clientId = process.env.TWITCH_CLIENT_ID;
-    if (!clientId) throw new Error('TWITCH_CLIENT_ID env var not set');
-    const token = await getTwitchToken();
-    const raw = await fetchText(`https://api.twitch.tv/helix/${path}`, {
-        'Client-Id': clientId,
-        'Authorization': `Bearer ${token}`,
-    });
-    return JSON.parse(raw);
 }
 
 // Cache login→id mappings to avoid repeated lookups
