@@ -1,8 +1,111 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { Pool } = require('pg');
 const dns = require('dns');
+const crypto = require('crypto');
+const { URL } = require('url');
 const http = require('http'), https = require('https');
 const { XMLParser } = require('fast-xml-parser');
+
+// ── OAuth config (Instagram / TikTok) ───────────────────────────────────────
+// Set these env vars on Render. PUBLIC_BASE_URL should be your Render external
+// URL (e.g. https://yourbot.onrender.com) with no trailing slash — it's used
+// to build the OAuth redirect URIs, which must match EXACTLY what you register
+// in the Meta App dashboard / TikTok Developer Portal.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+const OAUTH_CONFIG = {
+    instagram: {
+        clientId: process.env.INSTAGRAM_APP_ID,
+        clientSecret: process.env.INSTAGRAM_APP_SECRET,
+        redirectUri: `${PUBLIC_BASE_URL}/oauth/instagram/callback`,
+        authUrl: 'https://www.facebook.com/v21.0/dialog/oauth',
+        scope: 'instagram_basic,pages_show_list,instagram_manage_insights',
+    },
+    tiktok: {
+        clientId: process.env.TIKTOK_CLIENT_KEY,
+        clientSecret: process.env.TIKTOK_CLIENT_SECRET,
+        redirectUri: `${PUBLIC_BASE_URL}/oauth/tiktok/callback`,
+        authUrl: 'https://www.tiktok.com/v2/auth/authorize/',
+        scope: 'user.info.basic,video.list',
+    },
+};
+// In-memory pending OAuth states: state -> { guildId, userId, platform, expires }
+// A Discord-side "link" always starts and finishes within a few minutes, so
+// memory (rather than the DB) is fine here — if the process restarts mid-flow
+// the user just runs /social link again.
+const pendingOAuthStates = new Map();
+function createOAuthState(guildId, userId, platform) {
+    const state = crypto.randomBytes(16).toString('hex');
+    pendingOAuthStates.set(state, { guildId, userId, platform, expires: Date.now() + 10 * 60 * 1000 });
+    return state;
+}
+function consumeOAuthState(state) {
+    const entry = pendingOAuthStates.get(state);
+    if (!entry) return null;
+    pendingOAuthStates.delete(state);
+    if (entry.expires < Date.now()) return null;
+    return entry;
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of pendingOAuthStates) if (v.expires < now) pendingOAuthStates.delete(k);
+}, 5 * 60 * 1000);
+
+function postForm(urlStr, formData, extraHeaders = {}) {
+    return new Promise((resolve, reject) => {
+        const body = new URLSearchParams(formData).toString();
+        const u = new URL(urlStr);
+        const req = https.request({
+            hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body), ...extraHeaders },
+        }, res => {
+            const chunks = []; res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                try { resolve({ status: res.statusCode, json: JSON.parse(text) }); }
+                catch { resolve({ status: res.statusCode, json: null, text }); }
+            });
+        });
+        req.on('error', reject);
+        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
+        req.write(body); req.end();
+    });
+}
+function postJson(urlStr, bodyObj, extraHeaders = {}) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify(bodyObj);
+        const u = new URL(urlStr);
+        const req = https.request({
+            hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), ...extraHeaders },
+        }, res => {
+            const chunks = []; res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                try { resolve({ status: res.statusCode, json: JSON.parse(text) }); }
+                catch { resolve({ status: res.statusCode, json: null, text }); }
+            });
+        });
+        req.on('error', reject);
+        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
+        req.write(body); req.end();
+    });
+}
+function fetchJson(urlStr, headers = {}) {
+    return new Promise((resolve, reject) => {
+        const u = new URL(urlStr);
+        const req = https.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers }, res => {
+            const chunks = []; res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                try { resolve({ status: res.statusCode, json: JSON.parse(text) }); }
+                catch { resolve({ status: res.statusCode, json: null, text }); }
+            });
+        });
+        req.on('error', reject);
+        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
+        req.end();
+    });
+}
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 let pool; // created in initDB() after resolving the DB host to IPv4
@@ -41,6 +144,8 @@ const PLATFORMS = {
     youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
     twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF' },
+    instagram: { label: 'Instagram', emoji: '📸', color: '#E1306C', oauth: true },
+    tiktok:    { label: 'TikTok',    emoji: '🎵', color: '#010101', oauth: true },
 };
 
 // Notification types per platform. Each watch stores a subset of these in `notify_types` (JSONB array).
@@ -56,6 +161,12 @@ const PLATFORM_NOTIFY_TYPES = {
         { id: 'live',   label: 'Live',   description: 'Stream goes live' },
         { id: 'vods',   label: 'VODs',   description: 'New VOD/past broadcast uploaded' },
     ],
+    instagram: [
+        { id: 'posts',   label: 'Posts',   description: 'Feed photos/videos' },
+        { id: 'reels',   label: 'Reels',   description: 'Reels' },
+        { id: 'stories', label: 'Stories', description: 'Stories (24h, if available)' },
+    ],
+    tiktok:    [{ id: 'videos', label: 'Videos', description: 'New TikTok videos' }],
 };
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
@@ -82,6 +193,23 @@ async function initDB() {
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS seen_post_ids JSONB NOT NULL DEFAULT '[]';
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS notify_types JSONB;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS message_templates JSONB;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS social_link_id INTEGER;
+
+        CREATE TABLE IF NOT EXISTS social_links (
+            id SERIAL PRIMARY KEY,
+            guild_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            external_user_id TEXT NOT NULL,
+            external_username TEXT,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            expires_at BIGINT,
+            linked_by TEXT,
+            linked_at BIGINT,
+            UNIQUE (guild_id, platform, external_user_id)
+        );
+        CREATE INDEX IF NOT EXISTS social_links_guild_platform ON social_links(guild_id, platform);
     `);
     // Backfill seen_post_ids for existing rows so nothing re-fires after migration
     await pool.query(`
@@ -176,6 +304,42 @@ async function updateWatchChannel(guildId, id, channelId) {
 async function updateWatchNotifyTypes(guildId, id, types) {
     await pool.query('UPDATE watches SET notify_types = $1 WHERE guild_id = $2 AND id = $3', [JSON.stringify(types), guildId, id]);
 }
+async function updateWatchMessageTemplates(guildId, id, templatesObj) {
+    await pool.query('UPDATE watches SET message_templates = $1 WHERE guild_id = $2 AND id = $3', [JSON.stringify(templatesObj), guildId, id]);
+}
+async function setWatchSocialLink(guildId, id, socialLinkId) {
+    await pool.query('UPDATE watches SET social_link_id = $1 WHERE guild_id = $2 AND id = $3', [socialLinkId, guildId, id]);
+}
+
+// ── Social account links (OAuth) ────────────────────────────────────────────
+async function upsertSocialLink({ guildId, platform, externalUserId, externalUsername, accessToken, refreshToken, expiresAt, linkedBy }) {
+    const res = await pool.query(
+        `INSERT INTO social_links (guild_id, platform, external_user_id, external_username, access_token, refresh_token, expires_at, linked_by, linked_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (guild_id, platform, external_user_id) DO UPDATE SET
+            external_username = EXCLUDED.external_username, access_token = EXCLUDED.access_token,
+            refresh_token = EXCLUDED.refresh_token, expires_at = EXCLUDED.expires_at,
+            linked_by = EXCLUDED.linked_by, linked_at = EXCLUDED.linked_at
+         RETURNING *`,
+        [guildId, platform, externalUserId, externalUsername, accessToken, refreshToken ?? null, expiresAt ?? null, linkedBy, Date.now()]
+    );
+    return res.rows[0];
+}
+async function getSocialLinks(guildId, platform) {
+    const res = await pool.query('SELECT * FROM social_links WHERE guild_id = $1 AND platform = $2 ORDER BY external_username', [guildId, platform]);
+    return res.rows;
+}
+async function getSocialLinkByUsername(guildId, platform, username) {
+    const res = await pool.query('SELECT * FROM social_links WHERE guild_id = $1 AND platform = $2 AND lower(external_username) = lower($3)', [guildId, platform, username]);
+    return res.rows[0] || null;
+}
+async function getSocialLinkById(id) {
+    const res = await pool.query('SELECT * FROM social_links WHERE id = $1', [id]);
+    return res.rows[0] || null;
+}
+async function updateSocialLinkTokens(id, accessToken, refreshToken, expiresAt) {
+    await pool.query('UPDATE social_links SET access_token = $1, refresh_token = COALESCE($2, refresh_token), expires_at = $3 WHERE id = $4', [accessToken, refreshToken, expiresAt, id]);
+}
 async function getWatch(guildId, id) {
     const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 AND id = $2', [guildId, id]);
     return res.rows[0] || null;
@@ -232,6 +396,14 @@ function normalizeHandle(platform, raw) {
         h = h.replace(/^twitch\.tv\//i, '');
         h = h.replace(/^@/, '');
         h = h.split(/[/?]/)[0].toLowerCase();
+    } else if (platform === 'instagram') {
+        h = h.replace(/^(instagram\.com)\//i, '');
+        h = h.replace(/^@/, '');
+        h = h.split(/[/?]/)[0];
+    } else if (platform === 'tiktok') {
+        h = h.replace(/^(tiktok\.com)\/@?/i, '');
+        h = h.replace(/^@/, '');
+        h = h.split(/[/?]/)[0];
     }
     return h;
 }
@@ -240,6 +412,8 @@ function profileUrl(platform, handle) {
         case 'youtube': return handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/channel/${handle}`;
         case 'twitter': return `https://x.com/${handle}`;
         case 'twitch': return `https://www.twitch.tv/${handle}`;
+        case 'instagram': return `https://www.instagram.com/${handle}`;
+        case 'tiktok': return `https://www.tiktok.com/@${handle}`;
     }
 }
 
@@ -438,13 +612,99 @@ async function fetchLatestPost(platform, handle) {
     switch (platform) {
         case 'youtube': return fetchLatestYouTube(handle);
         case 'twitter': return fetchLatestTwitter(handle);
-        case 'twitch': return null; // Twitch uses fetchLatestTwitchAll — handled separately in pollAll
+        case 'twitch': return null;    // handled separately in pollAll (fetchLatestTwitchAll)
+        case 'instagram': return null; // handled separately in pollAll (fetchLatestInstagramAll)
+        case 'tiktok': return null;    // handled separately in pollAll (fetchLatestTikTokAll)
         default: return null;
     }
 }
 
+// ── OAuth token refresh (Instagram / TikTok) ───────────────────────────────
+// Refreshes a stored social_links row's access token if it's near expiry.
+// Returns the (possibly updated) row, or throws if refresh fails — callers
+// should treat a throw as "the link is dead, tell the person to /social link again".
+async function ensureFreshToken(link) {
+    const REFRESH_MARGIN_MS = 24 * 60 * 60 * 1000; // refresh if <24h left
+    if (!link.expires_at || link.expires_at - Date.now() > REFRESH_MARGIN_MS) return link;
+
+    if (link.platform === 'instagram') {
+        const cfg = OAUTH_CONFIG.instagram;
+        // Long-lived Facebook user/page tokens are refreshed via a fresh fb_exchange_token call.
+        const { json } = await fetchJson(
+            `https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${cfg.clientId}&client_secret=${cfg.clientSecret}&fb_exchange_token=${encodeURIComponent(link.access_token)}`
+        );
+        if (!json?.access_token) throw new Error('Instagram token refresh failed — re-link with /social link.');
+        const expiresAt = Date.now() + (json.expires_in ? json.expires_in * 1000 : 55 * 24 * 60 * 60 * 1000);
+        await updateSocialLinkTokens(link.id, json.access_token, null, expiresAt);
+        return { ...link, access_token: json.access_token, expires_at: expiresAt };
+    }
+
+    if (link.platform === 'tiktok') {
+        const cfg = OAUTH_CONFIG.tiktok;
+        if (!link.refresh_token) throw new Error('TikTok refresh token missing — re-link with /social link.');
+        const { json } = await postForm('https://open.tiktokapis.com/v2/oauth/token/', {
+            client_key: cfg.clientId, client_secret: cfg.clientSecret,
+            grant_type: 'refresh_token', refresh_token: link.refresh_token,
+        });
+        if (!json?.access_token) throw new Error('TikTok token refresh failed — re-link with /social link.');
+        const expiresAt = Date.now() + (json.expires_in ? json.expires_in * 1000 : 24 * 60 * 60 * 1000);
+        await updateSocialLinkTokens(link.id, json.access_token, json.refresh_token || link.refresh_token, expiresAt);
+        return { ...link, access_token: json.access_token, refresh_token: json.refresh_token || link.refresh_token, expires_at: expiresAt };
+    }
+
+    return link;
+}
+
+// ── Instagram (Meta Graph API) ─────────────────────────────────────────────
+async function fetchLatestInstagramAll(link) {
+    const fresh = await ensureFreshToken(link);
+    const { json } = await fetchJson(
+        `https://graph.facebook.com/v21.0/${fresh.external_user_id}/media?fields=id,caption,media_type,media_product_type,media_url,permalink,timestamp&limit=10&access_token=${encodeURIComponent(fresh.access_token)}`
+    );
+    if (json?.error) throw new Error(`Instagram API: ${json.error.message}`);
+    const items = json?.data || [];
+    return items.map(m => ({
+        id: m.id,
+        url: m.permalink,
+        title: (m.caption || '').slice(0, 200),
+        author: fresh.external_username,
+        thumbnail: m.media_type === 'VIDEO' ? null : m.media_url,
+        timestamp: m.timestamp,
+        // media_product_type: FEED | REELS | STORY (STORY rarely returned — stories expire in 24h and this endpoint mostly covers feed/reels)
+        postType: m.media_product_type === 'REELS' ? 'reels' : m.media_product_type === 'STORY' ? 'stories' : 'posts',
+    }));
+}
+
+// ── TikTok ───────────────────────────────────────────────────────────────
+async function fetchLatestTikTokAll(link) {
+    const fresh = await ensureFreshToken(link);
+    const { json } = await postJson(
+        'https://open.tiktokapis.com/v2/video/list/?fields=id,title,video_description,cover_image_url,share_url,create_time',
+        { max_count: 10 },
+        { Authorization: `Bearer ${fresh.access_token}` }
+    );
+    if (json?.error?.code && json.error.code !== 'ok') throw new Error(`TikTok API: ${json.error.message || json.error.code}`);
+    const items = json?.data?.videos || [];
+    return items.map(v => ({
+        id: v.id,
+        url: v.share_url,
+        title: (v.title || v.video_description || '').slice(0, 200),
+        author: fresh.external_username,
+        thumbnail: v.cover_image_url,
+        timestamp: v.create_time ? v.create_time * 1000 : Date.now(),
+        postType: 'videos',
+    }));
+}
+
 // ── Message templating ────────────────────────────────────────────────────
 const DEFAULT_TEMPLATE = '🔔 **{author}** just posted on {platform}!\n{url}';
+// Resolves the message template for a watch + post, preferring a per-post-type
+// override (w.message_templates[post.postType]) over the watch's single
+// message_template, over the global default.
+function resolveTemplate(w, post) {
+    if (post.postType && w.message_templates && w.message_templates[post.postType]) return w.message_templates[post.postType];
+    return w.message_template || null;
+}
 function renderTemplate(template, post, platform, handle) {
     const tmpl = template || DEFAULT_TEMPLATE;
     return tmpl
@@ -470,7 +730,7 @@ async function sendNotification(w, post) {
     if (!channel) return;
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
-    let content = renderTemplate(w.message_template, post, w.platform, w.handle);
+    let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
     if (w.role_id) content = `<@&${w.role_id}> ${content}`;
     const embed = new EmbedBuilder()
         .setColor(post.isLive ? '#FF0000' : p.color)
@@ -499,9 +759,17 @@ async function pollAll() {
             try {
                 const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
 
-                if (w.platform === 'twitch') {
-                    // Twitch returns multiple post types at once
-                    const posts = await fetchLatestTwitchAll(w.handle);
+                if (w.platform === 'twitch' || w.platform === 'instagram' || w.platform === 'tiktok') {
+                    // These platforms return multiple posts/post-types at once per check
+                    let posts;
+                    if (w.platform === 'twitch') {
+                        posts = await fetchLatestTwitchAll(w.handle);
+                    } else {
+                        if (!w.social_link_id) { await touchLastChecked(w.id); continue; } // not linked yet — nothing to poll
+                        const link = await getSocialLinkById(w.social_link_id);
+                        if (!link) { await touchLastChecked(w.id); continue; } // link was removed
+                        posts = w.platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
+                    }
                     let newSeenIds = [...seenIds];
                     let updated = false;
                     for (const post of posts) {
@@ -587,19 +855,24 @@ async function buildWatchListEmbed(guildId) {
 
 function buildManageView(w) {
     const p = PLATFORMS[w.platform];
+    const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+    const templates = w.message_templates || {};
+    const perTypeLines = types.filter(t => templates[t.id]).map(t => `**${t.label}:** \`${templates[t.id].slice(0, 80)}\``);
     const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emoji} ${w.handle}`).setTimestamp()
         .addFields(
             { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
             { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },
             { name: 'Ping role', value: w.role_id ? `<@&${w.role_id}>` : 'None', inline: true },
             { name: 'Notify types', value: (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : 'All types', inline: true },
-            { name: 'Message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
+            { name: 'Default message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
         );
+    if (perTypeLines.length) embed.addFields({ name: 'Per-type message overrides', value: perTypeLines.join('\n') });
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_msg_${w.id}`).setLabel('Edit Message').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(`socialmanage_role_${w.id}`).setLabel('Set/Clear Ping Role').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(`socialmanage_types_${w.id}`).setLabel('Edit Types').setStyle(ButtonStyle.Secondary),
+        ...(types.length > 1 ? [new ButtonBuilder().setCustomId(`socialpertype_open_${w.id}`).setLabel('Per-Type Messages').setStyle(ButtonStyle.Secondary)] : []),
     );
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_toggle_${w.id}`).setLabel(w.active ? 'Pause' : 'Resume').setStyle(w.active ? ButtonStyle.Secondary : ButtonStyle.Success),
@@ -637,9 +910,14 @@ client.once('ready', async () => {
             .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
             .addSubcommand(s => s.setName('debug').setDescription('Show live fetch result vs stored baseline for a watch')
                 .addIntegerOption(o => o.setName('id').setDescription('Watch ID (see /social list)').setRequired(true)))
+            .addSubcommand(s => s.setName('link').setDescription('Connect an Instagram or TikTok account via OAuth so it can be tracked')
+                .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
+                    .addChoices({ name: 'Instagram', value: 'instagram' }, { name: 'TikTok', value: 'tiktok' })))
+            .addSubcommand(s => s.setName('links').setDescription('View accounts linked via OAuth in this server'))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
         new SlashCommandBuilder().setName('config').setDescription('Configure the bot')
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
+        new SlashCommandBuilder().setName('killbot').setDescription('Owner only: suspend the Render service to stop usage'),
     ];
     await client.application.commands.set(commands).catch(e => console.error('command registration:', e));
 
@@ -730,23 +1008,42 @@ client.on('interactionCreate', async interaction => {
                 if (watches.length >= 50) return interaction.editReply('❌ This server has reached the maximum of 50 tracked accounts.');
 
                 let post = null;
-                try {
-                    if (platform === 'twitch') {
-                        const posts = await fetchLatestTwitchAll(handle);
-                        post = posts[0] || null;
-                    } else {
-                        post = await fetchLatestPost(platform, handle);
+                let socialLinkId = null;
+                if (PLATFORMS[platform].oauth) {
+                    // Instagram/TikTok can only be watched for accounts that have gone through
+                    // /social link — there's no way to poll an arbitrary public account via
+                    // their official APIs without that account's consent.
+                    const link = await getSocialLinkByUsername(guildId, platform, handle);
+                    if (!link) {
+                        return interaction.editReply(`❌ **${handle}** hasn't been linked yet. That account needs to run \`/social link\` and authorize with ${PLATFORMS[platform].label} first — this bot can't watch ${PLATFORMS[platform].label} accounts that haven't consented.\nUse \`/social links\` to see what's already linked in this server.`);
                     }
-                } catch (e) {
-                    if (/HTTP 429/.test(e.message)) {
-                        // Rate-limited on verify — account likely exists, proceed anyway
-                        post = null;
-                    } else {
-                        return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}\nDouble-check the handle/URL and try again.`);
+                    socialLinkId = link.id;
+                    try {
+                        const posts = platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
+                        post = posts[0] || null;
+                    } catch (e) {
+                        return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}`);
+                    }
+                } else {
+                    try {
+                        if (platform === 'twitch') {
+                            const posts = await fetchLatestTwitchAll(handle);
+                            post = posts[0] || null;
+                        } else {
+                            post = await fetchLatestPost(platform, handle);
+                        }
+                    } catch (e) {
+                        if (/HTTP 429/.test(e.message)) {
+                            // Rate-limited on verify — account likely exists, proceed anyway
+                            post = null;
+                        } else {
+                            return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}\nDouble-check the handle/URL and try again.`);
+                        }
                     }
                 }
 
                 const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, messageTemplate: message, addedBy: interaction.user.tag });
+                if (socialLinkId) await setWatchSocialLink(guildId, watch.id, socialLinkId);
                 // Seed last_post_id so the first poll doesn't fire a notification for existing content
                 await updateLastPost(watch.id, post?.id || null);
 
@@ -782,7 +1079,10 @@ client.on('interactionCreate', async interaction => {
                 const skipRow = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setCustomId(`socialtype_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
                 );
-                await interaction.editReply({ embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] });
+                const msgRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}`).setLabel('Set custom message per type').setStyle(ButtonStyle.Primary)
+                );
+                await interaction.editReply({ embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow, msgRow] });
                 return;
             }
 
@@ -805,7 +1105,17 @@ client.on('interactionCreate', async interaction => {
                 if (!w) return interaction.editReply(`❌ No watch with ID \`${id}\` in this server. Use \`/social list\` to see IDs.`);
 
                 let post = null, fetchError = null;
-                try { post = await fetchLatestPost(w.platform, w.handle); }
+                try {
+                    if (w.platform === 'twitch') post = (await fetchLatestTwitchAll(w.handle))[0] || null;
+                    else if (w.platform === 'instagram' || w.platform === 'tiktok') {
+                        if (!w.social_link_id) throw new Error('Not linked — run /social link first.');
+                        const link = await getSocialLinkById(w.social_link_id);
+                        if (!link) throw new Error('Linked account no longer found — re-link with /social link.');
+                        post = (w.platform === 'instagram' ? (await fetchLatestInstagramAll(link)) : (await fetchLatestTikTokAll(link)))[0] || null;
+                    } else {
+                        post = await fetchLatestPost(w.platform, w.handle);
+                    }
+                }
                 catch (e) { fetchError = e.message; }
 
                 const embed = E('#5865F2', `Debug — ${PLATFORMS[w.platform].label} ${w.handle}`)
@@ -828,6 +1138,65 @@ client.on('interactionCreate', async interaction => {
                 }
                 return interaction.editReply({ embeds: [embed] });
             }
+
+            if (sub === 'link') {
+                const platform = interaction.options.getString('platform');
+                const cfg = OAUTH_CONFIG[platform];
+                if (!cfg.clientId || !cfg.clientSecret) {
+                    return reply(`❌ ${PLATFORMS[platform].label} OAuth isn't configured on this bot yet (missing app credentials env vars). Ask the bot owner to set them up.`);
+                }
+                if (!PUBLIC_BASE_URL) {
+                    return reply('❌ PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL) isn\'t set, so OAuth redirects have nowhere to go. Ask the bot owner to configure it.');
+                }
+                const state = createOAuthState(guildId, interaction.user.id, platform);
+                const authUrl = `${cfg.authUrl}?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setLabel(`Authorize with ${PLATFORMS[platform].label}`).setStyle(ButtonStyle.Link).setURL(authUrl)
+                );
+                return reply({
+                    embeds: [E('#5865F2', `Link ${PLATFORMS[platform].label}`).setDescription(`Click below and log in with the **${PLATFORMS[platform].label} account you want this bot to track**. That account has to authorize this app — the bot can't watch accounts that haven't consented.\n\nThis link expires in 10 minutes.`)],
+                    components: [row],
+                    flags: [MessageFlags.Ephemeral],
+                });
+            }
+
+            if (sub === 'links') {
+                const igLinks = await getSocialLinks(guildId, 'instagram');
+                const ttLinks = await getSocialLinks(guildId, 'tiktok');
+                const embed = E('#5865F2', 'Linked Accounts').setDescription('Accounts authorized via `/social link` in this server. Only these can be added with `/social add`.');
+                embed.addFields(
+                    { name: '📸 Instagram', value: igLinks.length ? igLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
+                    { name: '🎵 TikTok', value: ttLinks.length ? ttLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
+                );
+                return reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+            }
+        }
+        return;
+    }
+
+    if (interaction.isChatInputCommand() && interaction.commandName === 'killbot') {
+        const ownerId = process.env.BOT_OWNER_ID;
+        if (!ownerId || interaction.user.id !== ownerId) {
+            return interaction.reply({ content: '❌ This command is owner-only.', flags: [MessageFlags.Ephemeral] });
+        }
+        await interaction.reply({ content: '🛑 Suspending the Render service…', flags: [MessageFlags.Ephemeral] });
+        const renderKey = process.env.RENDER_API_KEY, serviceId = process.env.RENDER_SERVICE_ID;
+        if (renderKey && serviceId) {
+            try {
+                const { status } = await postJson(`https://api.render.com/v1/services/${serviceId}/suspend`, {}, { Authorization: `Bearer ${renderKey}` });
+                if (status >= 200 && status < 300) {
+                    await interaction.followUp({ content: '✅ Render service suspended — it will stay off (and stop using hours) until manually resumed from the Render dashboard.', flags: [MessageFlags.Ephemeral] }).catch(() => {});
+                } else {
+                    await interaction.followUp({ content: `⚠️ Render API returned status ${status}. Falling back to crashing the process.`, flags: [MessageFlags.Ephemeral] }).catch(() => {});
+                    process.exit(1);
+                }
+            } catch (e) {
+                await interaction.followUp({ content: `⚠️ Render suspend call failed (${e.message}). Falling back to crashing the process.`, flags: [MessageFlags.Ephemeral] }).catch(() => {});
+                process.exit(1);
+            }
+        } else {
+            await interaction.followUp({ content: '⚠️ RENDER_API_KEY/RENDER_SERVICE_ID not set, so I can\'t properly suspend the service — just crashing the process instead. Note: on most Render plans this alone gets restarted automatically and will keep using hours. Set those two env vars for a real stop.', flags: [MessageFlags.Ephemeral] }).catch(() => {});
+            process.exit(1);
         }
         return;
     }
@@ -1015,6 +1384,46 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply({ embeds, components });
     }
 
+    // ── Button: open per-post-type custom message popup form ────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('socialpertype_open_')) {
+        const id = parseInt(interaction.customId.slice(20), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+        const templates = w.message_templates || {};
+        const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${id}`).setTitle(`Per-Type Messages — ${w.handle}`.slice(0, 45));
+        // Discord modals support at most 5 text inputs — every platform we support has ≤3 notify types, so this always fits.
+        modal.addComponents(
+            ...types.slice(0, 5).map(t => new ActionRowBuilder().addComponents(
+                new TextInputBuilder().setCustomId(`tmpl_${t.id}`).setLabel(`Message for ${t.label} (blank = default)`)
+                    .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)
+                    .setValue(templates[t.id] || '')
+                    .setPlaceholder('{author} just posted on {platform}!\n{url}')
+            ))
+        );
+        return interaction.showModal(modal);
+    }
+
+    // ── Modal: save per-post-type custom messages ────────────────────────────
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('socialpertype_modal_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const id = parseInt(interaction.customId.slice(21), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
+        const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+        const updatedTemplates = {};
+        for (const t of types.slice(0, 5)) {
+            const val = interaction.fields.getTextInputValue(`tmpl_${t.id}`).trim();
+            if (val) updatedTemplates[t.id] = val;
+        }
+        await updateWatchMessageTemplates(guildId, id, updatedTemplates);
+        await interaction.deferUpdate();
+        const updated = await getWatch(guildId, id);
+        const { embeds, components } = buildManageView(updated);
+        return interaction.editReply({ embeds, components });
+    }
+
   } catch (error) {
       if (error?.code === 40060) return;
       console.error('❌ Interaction error:', error);
@@ -1038,8 +1447,89 @@ client.on('interactionCreate', async interaction => {
 process.on('unhandledRejection', e => console.error('⚠️ Unhandled rejection:', e));
 client.on('error', e => console.error('⚠️ Discord client error:', e));
 
+// ── OAuth code exchange (called from the HTTP callback routes) ────────────
+async function exchangeInstagramCode(code) {
+    const cfg = OAUTH_CONFIG.instagram;
+    // 1. Exchange the auth code for a short-lived user access token.
+    const { json: tokenRes } = await postForm('https://graph.facebook.com/v21.0/oauth/access_token', {
+        client_id: cfg.clientId, client_secret: cfg.clientSecret, redirect_uri: cfg.redirectUri, code,
+    });
+    if (!tokenRes?.access_token) throw new Error(tokenRes?.error?.message || 'Instagram token exchange failed');
+
+    // 2. Exchange for a long-lived token (~60 days).
+    const { json: longRes } = await fetchJson(
+        `https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${cfg.clientId}&client_secret=${cfg.clientSecret}&fb_exchange_token=${encodeURIComponent(tokenRes.access_token)}`
+    );
+    const accessToken = longRes?.access_token || tokenRes.access_token;
+    const expiresIn = longRes?.expires_in || tokenRes.expires_in || 55 * 24 * 60 * 60;
+
+    // 3. Find the user's Facebook Page(s) and the Instagram professional account linked to one.
+    // (Instagram's Graph API requires the IG account to be Business/Creator and linked to a Page.)
+    const { json: pages } = await fetchJson(`https://graph.facebook.com/v21.0/me/accounts?access_token=${encodeURIComponent(accessToken)}`);
+    const page = (pages?.data || []).find(p => p.instagram_business_account);
+    if (!page) throw new Error('No Instagram professional account found — the account must be Business/Creator and linked to a Facebook Page.');
+    const igUserId = page.instagram_business_account.id;
+    const { json: igProfile } = await fetchJson(`https://graph.facebook.com/v21.0/${igUserId}?fields=username&access_token=${encodeURIComponent(accessToken)}`);
+
+    return { externalUserId: igUserId, externalUsername: igProfile?.username || igUserId, accessToken, refreshToken: null, expiresAt: Date.now() + expiresIn * 1000 };
+}
+
+async function exchangeTikTokCode(code) {
+    const cfg = OAUTH_CONFIG.tiktok;
+    const { json } = await postForm('https://open.tiktokapis.com/v2/oauth/token/', {
+        client_key: cfg.clientId, client_secret: cfg.clientSecret, code, grant_type: 'authorization_code', redirect_uri: cfg.redirectUri,
+    });
+    if (!json?.access_token) throw new Error(json?.error_description || 'TikTok token exchange failed');
+    const { json: userInfo } = await postJson('https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name', {}, { Authorization: `Bearer ${json.access_token}` });
+    const username = userInfo?.data?.user?.display_name || json.open_id;
+    return {
+        externalUserId: json.open_id, externalUsername: username,
+        accessToken: json.access_token, refreshToken: json.refresh_token,
+        expiresAt: Date.now() + (json.expires_in || 86400) * 1000,
+    };
+}
+
+function htmlResponse(res, status, title, message) {
+    res.writeHead(status, { 'Content-Type': 'text/html' });
+    res.end(`<!DOCTYPE html><html><head><title>${title}</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;"><h2>${title}</h2><p>${message}</p></body></html>`);
+}
+
+async function handleOAuthCallback(platform, req, res) {
+    const u = new URL(req.url, `https://${req.headers.host}`);
+    const code = u.searchParams.get('code');
+    const state = u.searchParams.get('state');
+    const oauthError = u.searchParams.get('error');
+    if (oauthError) return htmlResponse(res, 400, 'Authorization denied', 'You can close this tab.');
+
+    const stateEntry = state ? consumeOAuthState(state) : null;
+    if (!stateEntry || stateEntry.platform !== platform) return htmlResponse(res, 400, 'Invalid or expired link', 'Run /social link again in Discord and try once more within 10 minutes.');
+    if (!code) return htmlResponse(res, 400, 'Missing code', 'Something went wrong — no authorization code was returned.');
+
+    try {
+        const identity = platform === 'instagram' ? await exchangeInstagramCode(code) : await exchangeTikTokCode(code);
+        await upsertSocialLink({
+            guildId: stateEntry.guildId, platform,
+            externalUserId: identity.externalUserId, externalUsername: identity.externalUsername,
+            accessToken: identity.accessToken, refreshToken: identity.refreshToken, expiresAt: identity.expiresAt,
+            linkedBy: stateEntry.userId,
+        });
+        return htmlResponse(res, 200, 'Linked!', `<b>${identity.externalUsername}</b> is now linked. You can close this tab and go back to Discord — use <code>/social add</code> to start tracking it.`);
+    } catch (e) {
+        console.error(`OAuth callback (${platform}):`, e.message);
+        return htmlResponse(res, 500, 'Link failed', `${e.message} — you can close this tab and try /social link again.`);
+    }
+}
+
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => { const ok = req.url === '/' || req.url === '/health'; res.writeHead(ok ? 200 : 404, { 'Content-Type': 'text/plain' }); res.end(ok ? 'Social notify bot is running!' : 'Not found'); }).listen(PORT, () => console.log(`🌐 HTTP server on port ${PORT}`));
+http.createServer((req, res) => {
+    const path = req.url.split('?')[0];
+    if (path === '/' || path === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('Social notify bot is running!');
+    }
+    if (path === '/oauth/instagram/callback') return handleOAuthCallback('instagram', req, res);
+    if (path === '/oauth/tiktok/callback') return handleOAuthCallback('tiktok', req, res);
+    res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
+}).listen(PORT, () => console.log(`🌐 HTTP server on port ${PORT}`));
 
 // Keep-alive: ping our own URL periodically so Render's free tier doesn't spin down.
 const KEEP_ALIVE_URL = process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE_URL;
