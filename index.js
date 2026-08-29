@@ -1171,7 +1171,7 @@ client.on('interactionCreate', async interaction => {
                 return reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
             }
         }
-        return;
+        if (commandName === 'invite' || commandName === 'help' || commandName === 'config' || commandName === 'social') return;
     }
 
     if (interaction.isChatInputCommand() && interaction.commandName === 'killbot') {
