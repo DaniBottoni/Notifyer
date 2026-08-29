@@ -12,6 +12,7 @@ const { XMLParser } = require('fast-xml-parser');
 // to build the OAuth redirect URIs, which must match EXACTLY what you register
 // in the Meta App dashboard / TikTok Developer Portal.
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+const LEGAL_BASE_URL = PUBLIC_BASE_URL || 'https://your-app.onrender.com';
 const OAUTH_CONFIG = {
     instagram: {
         clientId: process.env.INSTAGRAM_APP_ID,
@@ -890,6 +891,7 @@ const helpEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Social 
         { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
         { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
         { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
+        { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
     );
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
@@ -1529,12 +1531,91 @@ async function handleOAuthCallback(platform, req, res) {
     }
 }
 
+function legalPage(title, bodyHtml) {
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} — Notifyer</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1a1a1a;} h1{margin-bottom:4px;} .updated{color:#666;font-size:0.9em;margin-top:0;} h2{margin-top:28px;} a{color:#5865F2;}</style>
+</head><body>${bodyHtml}</body></html>`;
+}
+
+const LEGAL_LAST_UPDATED = 'August 29, 2026';
+const LEGAL_CONTACT = process.env.LEGAL_CONTACT_EMAIL || process.env.BOT_OWNER_DISCORD_TAG || 'the bot owner via the support server';
+
+const TERMS_HTML = legalPage('Terms of Service', `
+<h1>Terms of Service</h1>
+<p class="updated">Last updated: ${LEGAL_LAST_UPDATED}</p>
+<p>These Terms govern your use of the Notifyer Discord bot ("the Bot"). By adding the Bot to a server or using its commands, you agree to these Terms.</p>
+
+<h2>What the Bot does</h2>
+<p>The Bot watches accounts you configure on YouTube, Twitter/X, Twitch, Instagram, and TikTok, and posts a notification in a Discord channel you choose when those accounts publish new content. For Instagram and TikTok, this only works for accounts that have explicitly authorized the Bot via OAuth (<code>/social link</code>) — the Bot cannot and does not access those platforms' accounts without their consent.</p>
+
+<h2>Acceptable use</h2>
+<ul>
+<li>You must comply with Discord's <a href="https://discord.com/terms">Terms of Service</a> and <a href="https://discord.com/guidelines">Community Guidelines</a> while using the Bot.</li>
+<li>You must have the right to link any Instagram or TikTok account you connect via <code>/social link</code> — only link accounts you own or are authorized to manage.</li>
+<li>Don't use the Bot to spam, harass, or send notifications to channels/servers without appropriate permission.</li>
+<li>Don't attempt to abuse, overload, or reverse-engineer the Bot's infrastructure.</li>
+</ul>
+
+<h2>No warranty</h2>
+<p>The Bot is provided "as is," without warranty of any kind. Notifications may be delayed, missed, or occasionally inaccurate, particularly where the Bot relies on unofficial or rate-limited data sources (e.g. Twitter). We don't guarantee uninterrupted availability.</p>
+
+<h2>Limitation of liability</h2>
+<p>To the maximum extent permitted by law, the Bot's operator is not liable for any indirect, incidental, or consequential damages arising from your use of, or inability to use, the Bot.</p>
+
+<h2>Termination</h2>
+<p>We may suspend or terminate the Bot's access to your server, or discontinue the Bot entirely, at any time. You can remove the Bot from your server at any time via Discord's server settings.</p>
+
+<h2>Changes</h2>
+<p>We may update these Terms from time to time. Continued use of the Bot after changes are posted constitutes acceptance of the revised Terms.</p>
+
+<h2>Contact</h2>
+<p>Questions about these Terms can be directed to ${LEGAL_CONTACT}.</p>
+`);
+
+const PRIVACY_HTML = legalPage('Privacy Policy', `
+<h1>Privacy Policy</h1>
+<p class="updated">Last updated: ${LEGAL_LAST_UPDATED}</p>
+<p>This Privacy Policy explains what data the Notifyer Discord bot ("the Bot") collects and how it's used.</p>
+
+<h2>Data we collect</h2>
+<ul>
+<li><b>Server configuration:</b> the Discord server (guild) ID, channel IDs, role IDs, and the account handles/URLs you choose to track, along with any custom notification message templates you set.</li>
+<li><b>Discord identifiers:</b> the Discord user ID and username of whoever adds a watch or links an account, stored only to show who configured something.</li>
+<li><b>OAuth tokens:</b> if you use <code>/social link</code> to connect an Instagram or TikTok account, we store the access token, refresh token, and the linked account's platform user ID/username, so the Bot can check that account for new posts on your behalf.</li>
+<li><b>Post metadata:</b> IDs and timestamps of posts already seen, so the Bot doesn't re-notify for the same content.</li>
+</ul>
+<p>We do not collect message content from your Discord server beyond what's needed to operate slash commands, and we do not read or store the content of DMs.</p>
+
+<h2>How we use data</h2>
+<p>Data is used solely to operate the Bot's core function: checking tracked accounts on a schedule and posting notifications to the channel you specify. We do not sell data, use it for advertising, or share it with third parties except the platform APIs (Instagram/TikTok) strictly as needed to fetch posts from accounts you've linked.</p>
+
+<h2>Data retention & deletion</h2>
+<p>Watch configurations and linked accounts are retained until you remove them (<code>/social list</code> → Remove, or by revoking a link) or remove the Bot from your server. You can request deletion of any data tied to your server or Discord account by contacting ${LEGAL_CONTACT}.</p>
+
+<h2>Third-party services</h2>
+<p>The Bot communicates with Discord's API, and — where you've configured it — YouTube, Twitter/X, Twitch, Meta's Instagram Graph API, and TikTok's API. Each of those platforms has its own privacy policy governing data you share with them directly.</p>
+
+<h2>Security</h2>
+<p>OAuth tokens are stored in a private database and are not exposed through any Bot command or public endpoint. No storage method is 100% secure, but we take reasonable steps to protect stored data.</p>
+
+<h2>Children's privacy</h2>
+<p>The Bot is not directed at children under 13, consistent with Discord's own age requirements.</p>
+
+<h2>Changes</h2>
+<p>We may update this Privacy Policy from time to time. Material changes will be reflected by updating the "Last updated" date above.</p>
+
+<h2>Contact</h2>
+<p>Questions about this policy, or requests to access/delete your data, can be directed to ${LEGAL_CONTACT}.</p>
+`);
+
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     const path = req.url.split('?')[0];
     if (path === '/' || path === '/health') {
         res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('Social notify bot is running!');
     }
+    if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
+    if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
     if (path === '/oauth/instagram/callback') return handleOAuthCallback('instagram', req, res);
     if (path === '/oauth/tiktok/callback') return handleOAuthCallback('tiktok', req, res);
     res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
