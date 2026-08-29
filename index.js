@@ -1386,7 +1386,7 @@ client.on('interactionCreate', async interaction => {
 
     // ── Button: open per-post-type custom message popup form ────────────────
     if (interaction.isButton() && interaction.customId.startsWith('socialpertype_open_')) {
-        const id = parseInt(interaction.customId.slice(20), 10);
+        const id = parseInt(interaction.customId.slice(19), 10);
         const w = await getWatch(guildId, id);
         if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
@@ -1408,7 +1408,7 @@ client.on('interactionCreate', async interaction => {
     // ── Modal: save per-post-type custom messages ────────────────────────────
     if (interaction.isModalSubmit() && interaction.customId.startsWith('socialpertype_modal_')) {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const id = parseInt(interaction.customId.slice(21), 10);
+        const id = parseInt(interaction.customId.slice(20), 10);
         const w = await getWatch(guildId, id);
         if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
         const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
@@ -1441,7 +1441,16 @@ client.on('interactionCreate', async interaction => {
     } catch (e) {
         console.error('⚠️ initDB failed, starting bot anyway:', e.message);
     }
-    await client.login(process.env.DISCORD_TOKEN);
+    if (!process.env.DISCORD_TOKEN || !process.env.DISCORD_TOKEN.trim()) {
+        console.error('❌ DISCORD_TOKEN is missing or empty. Set it in this service\'s environment variables and redeploy.');
+        process.exit(1);
+    }
+    try {
+        await client.login(process.env.DISCORD_TOKEN.trim());
+    } catch (e) {
+        console.error('❌ Discord login failed:', e.message, '\nDouble-check DISCORD_TOKEN on this service — copy it fresh from the Developer Portal with no extra whitespace/quotes.');
+        process.exit(1);
+    }
 })();
 
 process.on('unhandledRejection', e => console.error('⚠️ Unhandled rejection:', e));
