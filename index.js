@@ -196,7 +196,7 @@ async function initDB() {
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS notify_types JSONB;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS message_templates JSONB;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS social_link_id INTEGER;
-
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS legacy_migrated BOOLEAN NOT NULL DEFAULT FALSE;
         CREATE TABLE IF NOT EXISTS social_links (
             id SERIAL PRIMARY KEY,
             guild_id TEXT NOT NULL,
@@ -218,6 +218,31 @@ async function initDB() {
         SET seen_post_ids = jsonb_build_array(last_post_id)
         WHERE last_post_id IS NOT NULL AND seen_post_ids = '[]'::jsonb
     `);
+    await migrateLegacyMessages();
+}
+
+// One-time (idempotent) migration: any watch still using the old single
+// message_template (from the removed /social add "message" option) gets that
+// same text copied into every post type under message_templates, so nothing
+// silently stops sending a message once the old field is phased out. Flagged
+// as legacy_migrated so the manage view can warn it hasn't been reviewed —
+// the wording was written for one generic message and may not fit every type.
+async function migrateLegacyMessages() {
+    const res = await pool.query(`
+        SELECT * FROM watches
+        WHERE message_template IS NOT NULL
+        AND (message_templates IS NULL OR message_templates = '{}'::jsonb)
+    `);
+    let migrated = 0;
+    for (const w of res.rows) {
+        const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+        if (types.length <= 1) continue; // single-type platforms have nothing meaningful to split into
+        const templates = {};
+        for (const t of types) templates[t.id] = w.message_template;
+        await pool.query('UPDATE watches SET message_templates = $1, legacy_migrated = TRUE WHERE id = $2', [JSON.stringify(templates), w.id]);
+        migrated++;
+    }
+    if (migrated) console.log(`🔄 Auto-migrated ${migrated} legacy single-message watch(es) to per-type messages.`);
 }
 
 const configCache = new Map();
@@ -306,7 +331,8 @@ async function updateWatchNotifyTypes(guildId, id, types) {
     await pool.query('UPDATE watches SET notify_types = $1 WHERE guild_id = $2 AND id = $3', [JSON.stringify(types), guildId, id]);
 }
 async function updateWatchMessageTemplates(guildId, id, templatesObj) {
-    await pool.query('UPDATE watches SET message_templates = $1 WHERE guild_id = $2 AND id = $3', [JSON.stringify(templatesObj), guildId, id]);
+    // Saving explicitly counts as "reviewed" — clear the outdated/legacy warning.
+    await pool.query('UPDATE watches SET message_templates = $1, legacy_migrated = FALSE WHERE guild_id = $2 AND id = $3', [JSON.stringify(templatesObj), guildId, id]);
 }
 async function setWatchSocialLink(guildId, id, socialLinkId) {
     await pool.query('UPDATE watches SET social_link_id = $1 WHERE guild_id = $2 AND id = $3', [socialLinkId, guildId, id]);
@@ -725,6 +751,23 @@ function shouldNotify(w, post) {
     return post.postType ? types.includes(post.postType) : true;
 }
 
+// ── Post-type → button label map (used instead of a generic "View post") ───
+const POST_TYPE_BUTTON_LABEL = {
+    youtube:   { videos: 'Watch Video', shorts: 'Watch Short', live: 'Watch Live' },
+    twitter:   { posts: 'View Tweet' },
+    twitch:    { live: 'Watch Stream', vods: 'Watch VOD' },
+    instagram: { posts: 'View Post', reels: 'Watch Reel', stories: 'View Story' },
+    tiktok:    { videos: 'Watch Video' },
+};
+function buttonLabelFor(platform, post) {
+    if (post.isLive) return POST_TYPE_BUTTON_LABEL[platform]?.live || 'Watch Live';
+    return POST_TYPE_BUTTON_LABEL[platform]?.[post.postType] || 'View Post';
+}
+
+// Platforms where Discord will render a native, playable video preview if the
+// raw URL appears in the message content (not just inside a custom embed).
+const NATIVE_VIDEO_PLATFORMS = new Set(['youtube', 'tiktok']);
+
 async function sendNotification(w, post) {
     const guild = client.guilds.cache.get(w.guild_id);
     const channel = guild?.channels.cache.get(w.channel_id);
@@ -732,7 +775,20 @@ async function sendNotification(w, post) {
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
     let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
+    // For YouTube/TikTok, make sure the raw video URL is present on its own so Discord
+    // auto-generates a playable video embed beneath the message (not just a thumbnail).
+    const wantsNativeVideo = NATIVE_VIDEO_PLATFORMS.has(w.platform) && post.url;
+    if (wantsNativeVideo && !content.includes(post.url)) content = `${content}\n${post.url}`;
     if (w.role_id) content = `<@&${w.role_id}> ${content}`;
+    const linkRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emoji)
+    );
+    if (wantsNativeVideo) {
+        // Discord's native video unfurl (from the raw URL above) already shows the title,
+        // thumbnail, and channel/author — a custom embed on top of that is redundant.
+        await channel.send({ content, components: [linkRow] }).catch(e => console.error('send notification:', e.message));
+        return;
+    }
     const embed = new EmbedBuilder()
         .setColor(post.isLive ? '#FF0000' : p.color)
         .setAuthor({ name: `${post.author || w.handle} • ${p.label}${typeLabel}` })
@@ -741,9 +797,6 @@ async function sendNotification(w, post) {
         .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
     if (post.thumbnail) embed.setImage(post.thumbnail);
-    const linkRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setLabel(post.isLive ? 'Watch live' : 'View post').setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emoji)
-    );
     await channel.send({ content, embeds: [embed], components: [linkRow] }).catch(e => console.error('send notification:', e.message));
 }
 
@@ -854,6 +907,30 @@ async function buildWatchListEmbed(guildId) {
     return { embeds: [embed], components };
 }
 
+// True when a watch's per-type messages were auto-migrated from the old
+// single message_template and haven't been reviewed/edited since.
+function isLegacyMessageFormat(w) {
+    return !!w.legacy_migrated;
+}
+
+// Shared modal builder used both from the manage view's "Per-Type Messages"
+// button and from the new guided /social add flow, so both stay in sync.
+function buildPerTypeMessageModal(w) {
+    const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+    const templates = w.message_templates || {};
+    const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}`).setTitle(`Per-Type Messages — ${w.handle}`.slice(0, 45));
+    // Discord modals support at most 5 text inputs — every platform we support has ≤3 notify types, so this always fits.
+    modal.addComponents(
+        ...types.slice(0, 5).map(t => new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId(`tmpl_${t.id}`).setLabel(`Message for ${t.label} (blank = default)`)
+                .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)
+                .setValue(templates[t.id] || '')
+                .setPlaceholder('{author} just posted on {platform}!\n{url}')
+        ))
+    );
+    return modal;
+}
+
 function buildManageView(w) {
     const p = PLATFORMS[w.platform];
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
@@ -868,6 +945,9 @@ function buildManageView(w) {
             { name: 'Default message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
         );
     if (perTypeLines.length) embed.addFields({ name: 'Per-type message overrides', value: perTypeLines.join('\n') });
+    if (isLegacyMessageFormat(w)) {
+        embed.addFields({ name: '⚠️ Outdated message', value: 'This message was auto-migrated from the old single-message format and hasn\'t been reviewed. It was written as one generic message and may not read well for every post type — check each type below (**Per-Type Messages**) and edit as needed.' });
+    }
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_msg_${w.id}`).setLabel('Edit Message').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
@@ -906,8 +986,7 @@ client.once('ready', async () => {
                 .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
                     .addChoices(...Object.entries(PLATFORMS).map(([k, v]) => ({ name: v.label, value: k }))))
                 .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
-                .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
-                .addStringOption(o => o.setName('message').setDescription('Custom message (supports {author} {handle} {platform} {title} {url})')))
+                .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
             .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
             .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
             .addSubcommand(s => s.setName('debug').setDescription('Show live fetch result vs stored baseline for a watch')
@@ -997,7 +1076,6 @@ client.on('interactionCreate', async interaction => {
                 const platform = interaction.options.getString('platform');
                 const rawHandle = interaction.options.getString('handle');
                 const channel = interaction.options.getChannel('channel');
-                const message = interaction.options.getString('message');
                 const handle = normalizeHandle(platform, rawHandle);
                 if (!handle) return reply('❌ Could not parse that handle/URL.');
 
@@ -1044,7 +1122,7 @@ client.on('interactionCreate', async interaction => {
                     }
                 }
 
-                const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, messageTemplate: message, addedBy: interaction.user.tag });
+                const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, addedBy: interaction.user.tag });
                 if (socialLinkId) await setWatchSocialLink(guildId, watch.id, socialLinkId);
                 // Seed last_post_id so the first poll doesn't fire a notification for existing content
                 await updateLastPost(watch.id, post?.id || null);
@@ -1055,36 +1133,39 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Platform', value: `${p.emoji} ${p.label}`, inline: true },
                     { name: 'Account', value: handle, inline: true },
                     { name: 'Channel', value: `${channel}`, inline: true },
-                    { name: 'Message', value: message || DEFAULT_TEMPLATE },
                     post?.title
                         ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }
                         : { name: 'Baseline', value: 'No posts found yet — will track from first post.' },
                 );
 
-                // If platform only has one type, skip the selector
+                // Single-type platforms (TikTok, Twitter) skip the type-choice step entirely —
+                // there's only one kind of post, so go straight to a "set your message" button.
                 if (types.length <= 1) {
-                    await interaction.editReply({ embeds: [successEmbed] });
+                    successEmbed.setDescription('One more step — set the notification message below.');
+                    const msgRow = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}`).setLabel('Set Message').setStyle(ButtonStyle.Primary)
+                    );
+                    await interaction.editReply({ embeds: [successEmbed], components: [msgRow] });
                     return;
                 }
 
-                // Show notification type selector
+                // Multi-type platforms: choose notification types first — selecting (or skipping)
+                // chains straight into the per-type message form, so this is a single guided path
+                // instead of separate optional buttons.
                 const typeEmbed = new EmbedBuilder().setColor('#5865F2')
                     .setTitle(`${p.emoji} Choose Notification Types`)
-                    .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below. You can change this later via \`/social list\`.`);
+                    .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`);
                 const typeRow = new ActionRowBuilder().addComponents(
                     new StringSelectMenuBuilder()
-                        .setCustomId(`socialtype_select_${watch.id}`)
+                        .setCustomId(`socialtypeadd_select_${watch.id}`)
                         .setPlaceholder('Select notification types…')
                         .setMinValues(1).setMaxValues(types.length)
                         .addOptions(types.map(t => ({ label: t.label, value: t.id, description: t.description })))
                 );
                 const skipRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`socialtype_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
+                    new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
                 );
-                const msgRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}`).setLabel('Set custom message per type').setStyle(ButtonStyle.Primary)
-                );
-                await interaction.editReply({ embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow, msgRow] });
+                await interaction.editReply({ embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] });
                 return;
             }
 
@@ -1319,6 +1400,25 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // ── Select/skip: notification types from the guided /social add flow —
+    // chains straight into the per-type message modal instead of just confirming.
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialtypeadd_select_')) {
+        const id = parseInt(interaction.customId.slice(21), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
+        await updateWatchNotifyTypes(guildId, id, interaction.values);
+        const updated = await getWatch(guildId, id);
+        return interaction.showModal(buildPerTypeMessageModal(updated));
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('socialtypeadd_skip_')) {
+        const id = parseInt(interaction.customId.slice(19), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
+        await updateWatchNotifyTypes(guildId, id, null);
+        const updated = await getWatch(guildId, id);
+        return interaction.showModal(buildPerTypeMessageModal(updated));
+    }
+
     // ── Select: notification types (post-add and manage flows) ──────────────
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialtype_select_')) {
         const id = parseInt(interaction.customId.slice(18), 10);
@@ -1392,19 +1492,7 @@ client.on('interactionCreate', async interaction => {
         const w = await getWatch(guildId, id);
         if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
-        const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
-        const templates = w.message_templates || {};
-        const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${id}`).setTitle(`Per-Type Messages — ${w.handle}`.slice(0, 45));
-        // Discord modals support at most 5 text inputs — every platform we support has ≤3 notify types, so this always fits.
-        modal.addComponents(
-            ...types.slice(0, 5).map(t => new ActionRowBuilder().addComponents(
-                new TextInputBuilder().setCustomId(`tmpl_${t.id}`).setLabel(`Message for ${t.label} (blank = default)`)
-                    .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)
-                    .setValue(templates[t.id] || '')
-                    .setPlaceholder('{author} just posted on {platform}!\n{url}')
-            ))
-        );
-        return interaction.showModal(modal);
+        return interaction.showModal(buildPerTypeMessageModal(w));
     }
 
     // ── Modal: save per-post-type custom messages ────────────────────────────
