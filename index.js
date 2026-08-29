@@ -1617,15 +1617,13 @@ http.createServer((req, res) => {
     if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
     if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
     // TikTok (and similar) URL-prefix/domain ownership verification: they give you a .txt
-    // file to download and host at a specific path. Set TIKTOK_VERIFY_FILENAME to that exact
-    // filename (e.g. "tiktok54ye0zN8LYl3cx2fMAolswrgKzdRfnvK.txt") and TIKTOK_VERIFY_CONTENT to
-    // the file's exact contents, then hit Verify on TikTok's side. No code changes needed if
-    // they ever ask you to re-verify with a new file — just update the two env vars.
-    if (process.env.TIKTOK_VERIFY_FILENAME && path === `/${process.env.TIKTOK_VERIFY_FILENAME}`) {
-        // .trim() guards against a stray leading/trailing newline or space getting added when
-        // pasting the file's content into Render's env var box — these verification strings are
-        // always a single token with no meaningful whitespace, so trimming is always safe here.
-        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end((process.env.TIKTOK_VERIFY_CONTENT || '').trim());
+    // file to download and host at a specific path. This is hardcoded from the actual
+    // downloaded file's content to avoid any copy/paste corruption through env vars — if
+    // TikTok ever issues a NEW verification file later, update these two constants.
+    const TIKTOK_VERIFY_FILENAME = process.env.TIKTOK_VERIFY_FILENAME || 'tiktok54ye0zN8LYl3cx2fMAolswrgKzdRfnvK.txt';
+    const TIKTOK_VERIFY_CONTENT = process.env.TIKTOK_VERIFY_CONTENT || 'tiktok-developers-site-verification=54ye0zN8LYl3cx2fMAolswrgKzdRfnvK';
+    if (path === `/${TIKTOK_VERIFY_FILENAME}`) {
+        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(TIKTOK_VERIFY_CONTENT);
     }
     if (path === '/oauth/instagram/callback') return handleOAuthCallback('instagram', req, res);
     if (path === '/oauth/tiktok/callback') return handleOAuthCallback('tiktok', req, res);
