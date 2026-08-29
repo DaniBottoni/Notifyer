@@ -1622,7 +1622,10 @@ http.createServer((req, res) => {
     // the file's exact contents, then hit Verify on TikTok's side. No code changes needed if
     // they ever ask you to re-verify with a new file — just update the two env vars.
     if (process.env.TIKTOK_VERIFY_FILENAME && path === `/${process.env.TIKTOK_VERIFY_FILENAME}`) {
-        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end(process.env.TIKTOK_VERIFY_CONTENT || '');
+        // .trim() guards against a stray leading/trailing newline or space getting added when
+        // pasting the file's content into Render's env var box — these verification strings are
+        // always a single token with no meaningful whitespace, so trimming is always safe here.
+        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end((process.env.TIKTOK_VERIFY_CONTENT || '').trim());
     }
     if (path === '/oauth/instagram/callback') return handleOAuthCallback('instagram', req, res);
     if (path === '/oauth/tiktok/callback') return handleOAuthCallback('tiktok', req, res);
