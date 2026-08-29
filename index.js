@@ -995,6 +995,9 @@ client.once('ready', async () => {
                 .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
                     .addChoices({ name: 'Instagram', value: 'instagram' }, { name: 'TikTok', value: 'tiktok' })))
             .addSubcommand(s => s.setName('links').setDescription('View accounts linked via OAuth in this server'))
+            .addSubcommand(s => s.setName('oauthdebug').setDescription('Owner only: show the exact OAuth config being sent to a platform')
+                .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
+                    .addChoices({ name: 'Instagram', value: 'instagram' }, { name: 'TikTok', value: 'tiktok' })))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
         new SlashCommandBuilder().setName('config').setDescription('Configure the bot')
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
@@ -1250,6 +1253,29 @@ client.on('interactionCreate', async interaction => {
                 embed.addFields(
                     { name: '📸 Instagram', value: igLinks.length ? igLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
                     { name: '🎵 TikTok', value: ttLinks.length ? ttLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
+                );
+                return reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+            }
+
+            if (sub === 'oauthdebug') {
+                const ownerId = process.env.BOT_OWNER_ID;
+                if (!ownerId || interaction.user.id !== ownerId) {
+                    return reply('❌ This command is owner-only (it can reveal partial app credentials).');
+                }
+                const platform = interaction.options.getString('platform');
+                const cfg = OAUTH_CONFIG[platform];
+                const maskedSecret = cfg.clientSecret ? `${cfg.clientSecret.slice(0, 4)}${'*'.repeat(Math.max(0, cfg.clientSecret.length - 8))}${cfg.clientSecret.slice(-4)}` : '(not set)';
+                const state = createOAuthState(guildId, interaction.user.id, platform);
+                const authUrl = `${cfg.authUrl}?client_id=${encodeURIComponent(cfg.clientId || '')}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
+                const embed = E('#5865F2', `OAuth Debug — ${PLATFORMS[platform].label}`).setDescription(
+                    'This is exactly what the bot is sending right now, read live from environment variables — compare each value character-by-character against the platform\'s developer dashboard.'
+                ).addFields(
+                    { name: 'client_id (full)', value: `\`${cfg.clientId || '(not set)'}\`` },
+                    { name: 'client_secret (masked)', value: `\`${maskedSecret}\`` },
+                    { name: 'redirect_uri', value: `\`${cfg.redirectUri}\`` },
+                    { name: 'scope', value: `\`${cfg.scope}\`` },
+                    { name: 'PUBLIC_BASE_URL resolved to', value: `\`${PUBLIC_BASE_URL || '(empty!)'}\`` },
+                    { name: 'Full authorize URL', value: authUrl.length > 1000 ? authUrl.slice(0, 1000) + '…' : authUrl },
                 );
                 return reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
             }
