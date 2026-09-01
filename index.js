@@ -34,10 +34,12 @@ const OAUTH_CONFIG = {
 // memory (rather than the DB) is fine here — if the process restarts mid-flow
 // the user just runs /social link again.
 const pendingOAuthStates = new Map();
+const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 function createOAuthState(guildId, userId, platform) {
     const state = crypto.randomBytes(16).toString('hex');
-    pendingOAuthStates.set(state, { guildId, userId, platform, expires: Date.now() + 10 * 60 * 1000 });
-    return state;
+    const expires = Date.now() + OAUTH_STATE_TTL_MS;
+    pendingOAuthStates.set(state, { guildId, userId, platform, expires });
+    return { state, expires };
 }
 function consumeOAuthState(state) {
     const entry = pendingOAuthStates.get(state);
@@ -145,6 +147,7 @@ const PLATFORMS = {
     youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
     twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF' },
+    kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18' },
     instagram: { label: 'Instagram', emoji: '📸', color: '#E1306C', oauth: true },
     tiktok:    { label: 'TikTok',    emoji: '🎵', color: '#010101', oauth: true },
 };
@@ -162,6 +165,9 @@ const PLATFORM_NOTIFY_TYPES = {
         { id: 'live',   label: 'Live',   description: 'Stream goes live' },
         { id: 'vods',   label: 'VODs',   description: 'New VOD/past broadcast uploaded' },
     ],
+    // Kick's official public API currently only exposes live status — no VOD/clip
+    // listing endpoint yet, so this platform launches with just one notify type.
+    kick:      [{ id: 'live', label: 'Live', description: 'Stream goes live' }],
     instagram: [
         { id: 'posts',   label: 'Posts',   description: 'Feed photos/videos' },
         { id: 'reels',   label: 'Reels',   description: 'Reels' },
@@ -423,6 +429,10 @@ function normalizeHandle(platform, raw) {
         h = h.replace(/^twitch\.tv\//i, '');
         h = h.replace(/^@/, '');
         h = h.split(/[/?]/)[0].toLowerCase();
+    } else if (platform === 'kick') {
+        h = h.replace(/^kick\.com\//i, '');
+        h = h.replace(/^@/, '');
+        h = h.split(/[/?]/)[0].toLowerCase();
     } else if (platform === 'instagram') {
         h = h.replace(/^(instagram\.com)\//i, '');
         h = h.replace(/^@/, '');
@@ -439,6 +449,7 @@ function profileUrl(platform, handle) {
         case 'youtube': return handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/channel/${handle}`;
         case 'twitter': return `https://x.com/${handle}`;
         case 'twitch': return `https://www.twitch.tv/${handle}`;
+        case 'kick': return `https://kick.com/${handle}`;
         case 'instagram': return `https://www.instagram.com/${handle}`;
         case 'tiktok': return `https://www.tiktok.com/@${handle}`;
     }
@@ -619,6 +630,62 @@ async function fetchLatestTwitchAll(handle) {
     return results;
 }
 
+// ── Kick ─────────────────────────────────────────────────────────────────
+// Kick's official public API. Live status is public data, so we use an
+// app-level Client Credentials token (no per-channel authorization needed) —
+// unlike Instagram/TikTok, this works for any public Kick channel.
+async function fetchKick(path) {
+    const clientId = process.env.KICK_CLIENT_ID, clientSecret = process.env.KICK_CLIENT_SECRET;
+    if (!clientId || !clientSecret) throw new Error('KICK_CLIENT_ID and KICK_CLIENT_SECRET env vars not set');
+    const token = await getKickAppToken();
+    const { json } = await fetchJson(`https://api.kick.com/public/v1/${path}`, { Authorization: `Bearer ${token}` });
+    return json;
+}
+
+let kickToken = null, kickTokenExpiry = 0;
+async function getKickAppToken() {
+    if (kickToken && Date.now() < kickTokenExpiry - 60_000) return kickToken;
+    const clientId = process.env.KICK_CLIENT_ID, clientSecret = process.env.KICK_CLIENT_SECRET;
+    if (!clientId || !clientSecret) throw new Error('KICK_CLIENT_ID and KICK_CLIENT_SECRET env vars not set');
+    const { json } = await postForm('https://id.kick.com/oauth/token', {
+        client_id: clientId, client_secret: clientSecret, grant_type: 'client_credentials',
+    });
+    if (!json?.access_token) throw new Error(`Kick token error: ${JSON.stringify(json)}`);
+    kickToken = json.access_token;
+    kickTokenExpiry = Date.now() + (json.expires_in * 1000);
+    return kickToken;
+}
+
+// Cache slug→broadcaster_user_id mappings to avoid repeated lookups
+const kickBroadcasterIdCache = new Map();
+async function getKickBroadcasterId(slug) {
+    if (kickBroadcasterIdCache.has(slug)) return kickBroadcasterIdCache.get(slug);
+    const data = await fetchKick(`channels?slug=${encodeURIComponent(slug)}`);
+    const channel = data?.data?.[0];
+    if (!channel) throw new Error(`Kick channel "${slug}" not found`);
+    kickBroadcasterIdCache.set(slug, channel.broadcaster_user_id);
+    return channel.broadcaster_user_id;
+}
+
+// Returns array of posts: [{id, url, title, author, thumbnail, timestamp, postType, isLive}]
+// — only ever 0 or 1 entries, since Kick's public API currently exposes live status only.
+async function fetchLatestKickAll(handle) {
+    const broadcasterId = await getKickBroadcasterId(handle);
+    const data = await fetchKick(`livestreams?broadcaster_user_id=${broadcasterId}`);
+    const stream = data?.data?.[0];
+    if (!stream) return [];
+    return [{
+        id: `live_${stream.id || stream.started_at}`,
+        url: `https://kick.com/${handle}`,
+        title: stream.stream_title || `${handle} is live!`,
+        author: handle,
+        thumbnail: (stream.thumbnail?.url || stream.thumbnail) || null,
+        timestamp: stream.started_at,
+        postType: 'live',
+        isLive: true,
+    }];
+}
+
 // ── YouTube post type detection ────────────────────────────────────────────
 async function detectYouTubePostType(videoId, url) {
     // Shorts have a distinctive URL pattern after redirect — check via oEmbed
@@ -640,6 +707,7 @@ async function fetchLatestPost(platform, handle) {
         case 'youtube': return fetchLatestYouTube(handle);
         case 'twitter': return fetchLatestTwitter(handle);
         case 'twitch': return null;    // handled separately in pollAll (fetchLatestTwitchAll)
+        case 'kick': return null;      // handled separately in pollAll (fetchLatestKickAll)
         case 'instagram': return null; // handled separately in pollAll (fetchLatestInstagramAll)
         case 'tiktok': return null;    // handled separately in pollAll (fetchLatestTikTokAll)
         default: return null;
@@ -756,6 +824,7 @@ const POST_TYPE_BUTTON_LABEL = {
     youtube:   { videos: 'Watch Video', shorts: 'Watch Short', live: 'Watch Live' },
     twitter:   { posts: 'View Tweet' },
     twitch:    { live: 'Watch Stream', vods: 'Watch VOD' },
+    kick:      { live: 'Watch Stream' },
     instagram: { posts: 'View Post', reels: 'Watch Reel', stories: 'View Story' },
     tiktok:    { videos: 'Watch Video' },
 };
@@ -813,11 +882,13 @@ async function pollAll() {
             try {
                 const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
 
-                if (w.platform === 'twitch' || w.platform === 'instagram' || w.platform === 'tiktok') {
+                if (w.platform === 'twitch' || w.platform === 'kick' || w.platform === 'instagram' || w.platform === 'tiktok') {
                     // These platforms return multiple posts/post-types at once per check
                     let posts;
                     if (w.platform === 'twitch') {
                         posts = await fetchLatestTwitchAll(w.handle);
+                    } else if (w.platform === 'kick') {
+                        posts = await fetchLatestKickAll(w.handle);
                     } else {
                         if (!w.social_link_id) { await touchLastChecked(w.id); continue; } // not linked yet — nothing to poll
                         const link = await getSocialLinkById(w.social_link_id);
@@ -1112,6 +1183,9 @@ client.on('interactionCreate', async interaction => {
                         if (platform === 'twitch') {
                             const posts = await fetchLatestTwitchAll(handle);
                             post = posts[0] || null;
+                        } else if (platform === 'kick') {
+                            const posts = await fetchLatestKickAll(handle);
+                            post = posts[0] || null;
                         } else {
                             post = await fetchLatestPost(platform, handle);
                         }
@@ -1193,6 +1267,7 @@ client.on('interactionCreate', async interaction => {
                 let post = null, fetchError = null;
                 try {
                     if (w.platform === 'twitch') post = (await fetchLatestTwitchAll(w.handle))[0] || null;
+                    else if (w.platform === 'kick') post = (await fetchLatestKickAll(w.handle))[0] || null;
                     else if (w.platform === 'instagram' || w.platform === 'tiktok') {
                         if (!w.social_link_id) throw new Error('Not linked — run /social link first.');
                         const link = await getSocialLinkById(w.social_link_id);
@@ -1234,13 +1309,13 @@ client.on('interactionCreate', async interaction => {
                 if (!PUBLIC_BASE_URL) {
                     return reply('❌ PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL) isn\'t set, so OAuth redirects have nowhere to go. Ask the bot owner to configure it.');
                 }
-                const state = createOAuthState(guildId, interaction.user.id, platform);
+                const { state, expires } = createOAuthState(guildId, interaction.user.id, platform);
                 const authUrl = `${cfg.authUrl}?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
                 const row = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setLabel(`Authorize with ${PLATFORMS[platform].label}`).setStyle(ButtonStyle.Link).setURL(authUrl)
                 );
                 return reply({
-                    embeds: [E('#5865F2', `Link ${PLATFORMS[platform].label}`).setDescription(`Click below and log in with the **${PLATFORMS[platform].label} account you want this bot to track**. That account has to authorize this app — the bot can't watch accounts that haven't consented.\n\nThis link expires in 10 minutes.`)],
+                    embeds: [E('#5865F2', `Link ${PLATFORMS[platform].label}`).setDescription(`Click below and log in with the **${PLATFORMS[platform].label} account you want this bot to track**. That account has to authorize this app — the bot can't watch accounts that haven't consented.\n\nThis link expires <t:${Math.floor(expires / 1000)}:R>.`)],
                     components: [row],
                     flags: [MessageFlags.Ephemeral],
                 });
@@ -1265,7 +1340,7 @@ client.on('interactionCreate', async interaction => {
                 const platform = interaction.options.getString('platform');
                 const cfg = OAUTH_CONFIG[platform];
                 const maskedSecret = cfg.clientSecret ? `${cfg.clientSecret.slice(0, 4)}${'*'.repeat(Math.max(0, cfg.clientSecret.length - 8))}${cfg.clientSecret.slice(-4)}` : '(not set)';
-                const state = createOAuthState(guildId, interaction.user.id, platform);
+                const { state } = createOAuthState(guildId, interaction.user.id, platform);
                 const authUrl = `${cfg.authUrl}?client_id=${encodeURIComponent(cfg.clientId || '')}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
                 const embed = E('#5865F2', `OAuth Debug — ${PLATFORMS[platform].label}`).setDescription(
                     'This is exactly what the bot is sending right now, read live from environment variables — compare each value character-by-character against the platform\'s developer dashboard.'
