@@ -1402,7 +1402,7 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 const STATUS_HTML = legalPage('Status', `
 <h1>🔔 Notifyer</h1>
 <p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>
-<p>This is the backend for a Discord bot that posts notifications in a server channel whenever a tracked creator publishes new content or goes live.</p>
+<p>This is the backend for Notifyer, the fast and free Discord notification bot. Below you can access important links. </p>
 <p>
 <a href="/terms">Terms of Service</a> &nbsp;·&nbsp;
 <a href="/privacy">Privacy Policy</a> &nbsp;·&nbsp;
