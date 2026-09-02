@@ -1,8 +1,51 @@
 const { Client, GatewayIntentBits, SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ChannelSelectMenuBuilder, RoleSelectMenuBuilder, ChannelType, ActivityType, MessageFlags, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const { Pool } = require('pg');
 const dns = require('dns');
+const { URL } = require('url');
 const http = require('http'), https = require('https');
 const { XMLParser } = require('fast-xml-parser');
+
+// PUBLIC_BASE_URL should be your Render external URL (e.g. https://yourbot.onrender.com)
+// with no trailing slash — used only to build the /terms and /privacy links shown in /help.
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+const LEGAL_BASE_URL = PUBLIC_BASE_URL || 'https://your-app.onrender.com';
+
+function postForm(urlStr, formData, extraHeaders = {}) {
+    return new Promise((resolve, reject) => {
+        const body = new URLSearchParams(formData).toString();
+        const u = new URL(urlStr);
+        const req = https.request({
+            hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body), ...extraHeaders },
+        }, res => {
+            const chunks = []; res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                try { resolve({ status: res.statusCode, json: JSON.parse(text) }); }
+                catch { resolve({ status: res.statusCode, json: null, text }); }
+            });
+        });
+        req.on('error', reject);
+        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
+        req.write(body); req.end();
+    });
+}
+function fetchJson(urlStr, headers = {}) {
+    return new Promise((resolve, reject) => {
+        const u = new URL(urlStr);
+        const req = https.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers }, res => {
+            const chunks = []; res.on('data', c => chunks.push(c));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                try { resolve({ status: res.statusCode, json: JSON.parse(text) }); }
+                catch { resolve({ status: res.statusCode, json: null, text }); }
+            });
+        });
+        req.on('error', reject);
+        req.setTimeout(15000, () => req.destroy(new Error('Timeout')));
+        req.end();
+    });
+}
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 let pool; // created in initDB() after resolving the DB host to IPv4
@@ -41,6 +84,7 @@ const PLATFORMS = {
     youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
     twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF' },
+    kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18' },
 };
 
 // Notification types per platform. Each watch stores a subset of these in `notify_types` (JSONB array).
@@ -56,6 +100,9 @@ const PLATFORM_NOTIFY_TYPES = {
         { id: 'live',   label: 'Live',   description: 'Stream goes live' },
         { id: 'vods',   label: 'VODs',   description: 'New VOD/past broadcast uploaded' },
     ],
+    // Kick's official public API currently only exposes live status — no VOD/clip
+    // listing endpoint yet, so this platform launches with just one notify type.
+    kick:      [{ id: 'live', label: 'Live', description: 'Stream goes live' }],
 };
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
@@ -82,6 +129,8 @@ async function initDB() {
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS seen_post_ids JSONB NOT NULL DEFAULT '[]';
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS notify_types JSONB;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS message_templates JSONB;
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS legacy_migrated BOOLEAN NOT NULL DEFAULT FALSE;
     `);
     // Backfill seen_post_ids for existing rows so nothing re-fires after migration
     await pool.query(`
@@ -89,6 +138,31 @@ async function initDB() {
         SET seen_post_ids = jsonb_build_array(last_post_id)
         WHERE last_post_id IS NOT NULL AND seen_post_ids = '[]'::jsonb
     `);
+    await migrateLegacyMessages();
+}
+
+// One-time (idempotent) migration: any watch still using the old single
+// message_template (from the removed /social add "message" option) gets that
+// same text copied into every post type under message_templates, so nothing
+// silently stops sending a message once the old field is phased out. Flagged
+// as legacy_migrated so the manage view can warn it hasn't been reviewed —
+// the wording was written for one generic message and may not fit every type.
+async function migrateLegacyMessages() {
+    const res = await pool.query(`
+        SELECT * FROM watches
+        WHERE message_template IS NOT NULL
+        AND (message_templates IS NULL OR message_templates = '{}'::jsonb)
+    `);
+    let migrated = 0;
+    for (const w of res.rows) {
+        const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+        if (types.length <= 1) continue; // single-type platforms have nothing meaningful to split into
+        const templates = {};
+        for (const t of types) templates[t.id] = w.message_template;
+        await pool.query('UPDATE watches SET message_templates = $1, legacy_migrated = TRUE WHERE id = $2', [JSON.stringify(templates), w.id]);
+        migrated++;
+    }
+    if (migrated) console.log(`🔄 Auto-migrated ${migrated} legacy single-message watch(es) to per-type messages.`);
 }
 
 const configCache = new Map();
@@ -176,6 +250,10 @@ async function updateWatchChannel(guildId, id, channelId) {
 async function updateWatchNotifyTypes(guildId, id, types) {
     await pool.query('UPDATE watches SET notify_types = $1 WHERE guild_id = $2 AND id = $3', [JSON.stringify(types), guildId, id]);
 }
+async function updateWatchMessageTemplates(guildId, id, templatesObj) {
+    // Saving explicitly counts as "reviewed" — clear the outdated/legacy warning.
+    await pool.query('UPDATE watches SET message_templates = $1, legacy_migrated = FALSE WHERE guild_id = $2 AND id = $3', [JSON.stringify(templatesObj), guildId, id]);
+}
 async function getWatch(guildId, id) {
     const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 AND id = $2', [guildId, id]);
     return res.rows[0] || null;
@@ -232,6 +310,10 @@ function normalizeHandle(platform, raw) {
         h = h.replace(/^twitch\.tv\//i, '');
         h = h.replace(/^@/, '');
         h = h.split(/[/?]/)[0].toLowerCase();
+    } else if (platform === 'kick') {
+        h = h.replace(/^kick\.com\//i, '');
+        h = h.replace(/^@/, '');
+        h = h.split(/[/?]/)[0].toLowerCase();
     }
     return h;
 }
@@ -240,6 +322,7 @@ function profileUrl(platform, handle) {
         case 'youtube': return handle.startsWith('@') ? `https://www.youtube.com/${handle}` : `https://www.youtube.com/channel/${handle}`;
         case 'twitter': return `https://x.com/${handle}`;
         case 'twitch': return `https://www.twitch.tv/${handle}`;
+        case 'kick': return `https://kick.com/${handle}`;
     }
 }
 
@@ -418,6 +501,62 @@ async function fetchLatestTwitchAll(handle) {
     return results;
 }
 
+// ── Kick ─────────────────────────────────────────────────────────────────
+// Kick's official public API. Live status is public data, so we use an
+// app-level Client Credentials token (no per-channel authorization needed) —
+// unlike Instagram/TikTok, this works for any public Kick channel.
+async function fetchKick(path) {
+    const clientId = process.env.KICK_CLIENT_ID, clientSecret = process.env.KICK_CLIENT_SECRET;
+    if (!clientId || !clientSecret) throw new Error('KICK_CLIENT_ID and KICK_CLIENT_SECRET env vars not set');
+    const token = await getKickAppToken();
+    const { json } = await fetchJson(`https://api.kick.com/public/v1/${path}`, { Authorization: `Bearer ${token}` });
+    return json;
+}
+
+let kickToken = null, kickTokenExpiry = 0;
+async function getKickAppToken() {
+    if (kickToken && Date.now() < kickTokenExpiry - 60_000) return kickToken;
+    const clientId = process.env.KICK_CLIENT_ID, clientSecret = process.env.KICK_CLIENT_SECRET;
+    if (!clientId || !clientSecret) throw new Error('KICK_CLIENT_ID and KICK_CLIENT_SECRET env vars not set');
+    const { json } = await postForm('https://id.kick.com/oauth/token', {
+        client_id: clientId, client_secret: clientSecret, grant_type: 'client_credentials',
+    });
+    if (!json?.access_token) throw new Error(`Kick token error: ${JSON.stringify(json)}`);
+    kickToken = json.access_token;
+    kickTokenExpiry = Date.now() + (json.expires_in * 1000);
+    return kickToken;
+}
+
+// Cache slug→broadcaster_user_id mappings to avoid repeated lookups
+const kickBroadcasterIdCache = new Map();
+async function getKickBroadcasterId(slug) {
+    if (kickBroadcasterIdCache.has(slug)) return kickBroadcasterIdCache.get(slug);
+    const data = await fetchKick(`channels?slug=${encodeURIComponent(slug)}`);
+    const channel = data?.data?.[0];
+    if (!channel) throw new Error(`Kick channel "${slug}" not found`);
+    kickBroadcasterIdCache.set(slug, channel.broadcaster_user_id);
+    return channel.broadcaster_user_id;
+}
+
+// Returns array of posts: [{id, url, title, author, thumbnail, timestamp, postType, isLive}]
+// — only ever 0 or 1 entries, since Kick's public API currently exposes live status only.
+async function fetchLatestKickAll(handle) {
+    const broadcasterId = await getKickBroadcasterId(handle);
+    const data = await fetchKick(`livestreams?broadcaster_user_id=${broadcasterId}`);
+    const stream = data?.data?.[0];
+    if (!stream) return [];
+    return [{
+        id: `live_${stream.id || stream.started_at}`,
+        url: `https://kick.com/${handle}`,
+        title: stream.stream_title || `${handle} is live!`,
+        author: handle,
+        thumbnail: (stream.thumbnail?.url || stream.thumbnail) || null,
+        timestamp: stream.started_at,
+        postType: 'live',
+        isLive: true,
+    }];
+}
+
 // ── YouTube post type detection ────────────────────────────────────────────
 async function detectYouTubePostType(videoId, url) {
     // Shorts have a distinctive URL pattern after redirect — check via oEmbed
@@ -438,13 +577,21 @@ async function fetchLatestPost(platform, handle) {
     switch (platform) {
         case 'youtube': return fetchLatestYouTube(handle);
         case 'twitter': return fetchLatestTwitter(handle);
-        case 'twitch': return null; // Twitch uses fetchLatestTwitchAll — handled separately in pollAll
+        case 'twitch': return null;    // handled separately in pollAll (fetchLatestTwitchAll)
+        case 'kick': return null;      // handled separately in pollAll (fetchLatestKickAll)
         default: return null;
     }
 }
 
 // ── Message templating ────────────────────────────────────────────────────
 const DEFAULT_TEMPLATE = '🔔 **{author}** just posted on {platform}!\n{url}';
+// Resolves the message template for a watch + post, preferring a per-post-type
+// override (w.message_templates[post.postType]) over the watch's single
+// message_template, over the global default.
+function resolveTemplate(w, post) {
+    if (post.postType && w.message_templates && w.message_templates[post.postType]) return w.message_templates[post.postType];
+    return w.message_template || null;
+}
 function renderTemplate(template, post, platform, handle) {
     const tmpl = template || DEFAULT_TEMPLATE;
     return tmpl
@@ -464,14 +611,43 @@ function shouldNotify(w, post) {
     return post.postType ? types.includes(post.postType) : true;
 }
 
+// ── Post-type → button label map (used instead of a generic "View post") ───
+const POST_TYPE_BUTTON_LABEL = {
+    youtube:   { videos: 'Watch Video', shorts: 'Watch Short', live: 'Watch Live' },
+    twitter:   { posts: 'View Tweet' },
+    twitch:    { live: 'Watch Stream', vods: 'Watch VOD' },
+    kick:      { live: 'Watch Stream' },
+};
+function buttonLabelFor(platform, post) {
+    if (post.isLive) return POST_TYPE_BUTTON_LABEL[platform]?.live || 'Watch Live';
+    return POST_TYPE_BUTTON_LABEL[platform]?.[post.postType] || 'View Post';
+}
+
+// Platforms where Discord will render a native, playable video preview if the
+// raw URL appears in the message content (not just inside a custom embed).
+const NATIVE_VIDEO_PLATFORMS = new Set(['youtube']);
+
 async function sendNotification(w, post) {
     const guild = client.guilds.cache.get(w.guild_id);
     const channel = guild?.channels.cache.get(w.channel_id);
     if (!channel) return;
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
-    let content = renderTemplate(w.message_template, post, w.platform, w.handle);
+    let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
+    // For YouTube, make sure the raw video URL is present on its own so Discord
+    // auto-generates a playable video embed beneath the message (not just a thumbnail).
+    const wantsNativeVideo = NATIVE_VIDEO_PLATFORMS.has(w.platform) && post.url;
+    if (wantsNativeVideo && !content.includes(post.url)) content = `${content}\n${post.url}`;
     if (w.role_id) content = `<@&${w.role_id}> ${content}`;
+    const linkRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emoji)
+    );
+    if (wantsNativeVideo) {
+        // Discord's native video unfurl (from the raw URL above) already shows the title,
+        // thumbnail, and channel/author — a custom embed on top of that is redundant.
+        await channel.send({ content, components: [linkRow] }).catch(e => console.error('send notification:', e.message));
+        return;
+    }
     const embed = new EmbedBuilder()
         .setColor(post.isLive ? '#FF0000' : p.color)
         .setAuthor({ name: `${post.author || w.handle} • ${p.label}${typeLabel}` })
@@ -480,9 +656,6 @@ async function sendNotification(w, post) {
         .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
     if (post.thumbnail) embed.setImage(post.thumbnail);
-    const linkRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setLabel(post.isLive ? 'Watch live' : 'View post').setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emoji)
-    );
     await channel.send({ content, embeds: [embed], components: [linkRow] }).catch(e => console.error('send notification:', e.message));
 }
 
@@ -499,9 +672,14 @@ async function pollAll() {
             try {
                 const seenIds = Array.isArray(w.seen_post_ids) ? w.seen_post_ids : [];
 
-                if (w.platform === 'twitch') {
-                    // Twitch returns multiple post types at once
-                    const posts = await fetchLatestTwitchAll(w.handle);
+                if (w.platform === 'twitch' || w.platform === 'kick') {
+                    // These platforms return multiple posts/post-types at once per check
+                    let posts;
+                    if (w.platform === 'twitch') {
+                        posts = await fetchLatestTwitchAll(w.handle);
+                    } else {
+                        posts = await fetchLatestKickAll(w.handle);
+                    }
                     let newSeenIds = [...seenIds];
                     let updated = false;
                     for (const post of posts) {
@@ -585,21 +763,53 @@ async function buildWatchListEmbed(guildId) {
     return { embeds: [embed], components };
 }
 
+// True when a watch's per-type messages were auto-migrated from the old
+// single message_template and haven't been reviewed/edited since.
+function isLegacyMessageFormat(w) {
+    return !!w.legacy_migrated;
+}
+
+// Shared modal builder used both from the manage view's "Per-Type Messages"
+// button and from the new guided /social add flow, so both stay in sync.
+function buildPerTypeMessageModal(w) {
+    const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+    const templates = w.message_templates || {};
+    const modal = new ModalBuilder().setCustomId(`socialpertype_modal_${w.id}`).setTitle(`Per-Type Messages — ${w.handle}`.slice(0, 45));
+    // Discord modals support at most 5 text inputs — every platform we support has ≤3 notify types, so this always fits.
+    modal.addComponents(
+        ...types.slice(0, 5).map(t => new ActionRowBuilder().addComponents(
+            new TextInputBuilder().setCustomId(`tmpl_${t.id}`).setLabel(`Message for ${t.label} (blank = default)`)
+                .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)
+                .setValue(templates[t.id] || '')
+                .setPlaceholder('{author} just posted on {platform}!\n{url}')
+        ))
+    );
+    return modal;
+}
+
 function buildManageView(w) {
     const p = PLATFORMS[w.platform];
+    const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+    const templates = w.message_templates || {};
+    const perTypeLines = types.filter(t => templates[t.id]).map(t => `**${t.label}:** \`${templates[t.id].slice(0, 80)}\``);
     const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emoji} ${w.handle}`).setTimestamp()
         .addFields(
             { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
             { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },
             { name: 'Ping role', value: w.role_id ? `<@&${w.role_id}>` : 'None', inline: true },
             { name: 'Notify types', value: (Array.isArray(w.notify_types) && w.notify_types.length) ? w.notify_types.map(t => PLATFORM_NOTIFY_TYPES[w.platform]?.find(x => x.id === t)?.label || t).join(', ') : 'All types', inline: true },
-            { name: 'Message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
+            { name: 'Default message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
         );
+    if (perTypeLines.length) embed.addFields({ name: 'Per-type message overrides', value: perTypeLines.join('\n') });
+    if (isLegacyMessageFormat(w)) {
+        embed.addFields({ name: '⚠️ Outdated message', value: 'This message was auto-migrated from the old single-message format and hasn\'t been reviewed. It was written as one generic message and may not read well for every post type — check each type below (**Per-Type Messages**) and edit as needed.' });
+    }
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_msg_${w.id}`).setLabel('Edit Message').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`socialmanage_channel_${w.id}`).setLabel('Change Channel').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(`socialmanage_role_${w.id}`).setLabel('Set/Clear Ping Role').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(`socialmanage_types_${w.id}`).setLabel('Edit Types').setStyle(ButtonStyle.Secondary),
+        ...(types.length > 1 ? [new ButtonBuilder().setCustomId(`socialpertype_open_${w.id}`).setLabel('Per-Type Messages').setStyle(ButtonStyle.Secondary)] : []),
     );
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`socialmanage_toggle_${w.id}`).setLabel(w.active ? 'Pause' : 'Resume').setStyle(w.active ? ButtonStyle.Secondary : ButtonStyle.Success),
@@ -612,11 +822,12 @@ function buildManageView(w) {
 const helpEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Social Notify Bot')
     .setDescription('Get notified in a channel whenever a tracked account posts new content.')
     .addFields(
-        { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel. Optionally set a custom message.' },
+        { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel — you\'ll then choose notification types and set the message.' },
         { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
         { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
         { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
         { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
+        { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
     );
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
@@ -631,12 +842,9 @@ client.once('ready', async () => {
                 .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
                     .addChoices(...Object.entries(PLATFORMS).map(([k, v]) => ({ name: v.label, value: k }))))
                 .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
-                .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
-                .addStringOption(o => o.setName('message').setDescription('Custom message (supports {author} {handle} {platform} {title} {url})')))
+                .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
             .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
             .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
-            .addSubcommand(s => s.setName('debug').setDescription('Show live fetch result vs stored baseline for a watch')
-                .addIntegerOption(o => o.setName('id').setDescription('Watch ID (see /social list)').setRequired(true)))
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
         new SlashCommandBuilder().setName('config').setDescription('Configure the bot')
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
@@ -717,7 +925,6 @@ client.on('interactionCreate', async interaction => {
                 const platform = interaction.options.getString('platform');
                 const rawHandle = interaction.options.getString('handle');
                 const channel = interaction.options.getChannel('channel');
-                const message = interaction.options.getString('message');
                 const handle = normalizeHandle(platform, rawHandle);
                 if (!handle) return reply('❌ Could not parse that handle/URL.');
 
@@ -734,6 +941,9 @@ client.on('interactionCreate', async interaction => {
                     if (platform === 'twitch') {
                         const posts = await fetchLatestTwitchAll(handle);
                         post = posts[0] || null;
+                    } else if (platform === 'kick') {
+                        const posts = await fetchLatestKickAll(handle);
+                        post = posts[0] || null;
                     } else {
                         post = await fetchLatestPost(platform, handle);
                     }
@@ -746,7 +956,7 @@ client.on('interactionCreate', async interaction => {
                     }
                 }
 
-                const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, messageTemplate: message, addedBy: interaction.user.tag });
+                const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, addedBy: interaction.user.tag });
                 // Seed last_post_id so the first poll doesn't fire a notification for existing content
                 await updateLastPost(watch.id, post?.id || null);
 
@@ -756,31 +966,37 @@ client.on('interactionCreate', async interaction => {
                     { name: 'Platform', value: `${p.emoji} ${p.label}`, inline: true },
                     { name: 'Account', value: handle, inline: true },
                     { name: 'Channel', value: `${channel}`, inline: true },
-                    { name: 'Message', value: message || DEFAULT_TEMPLATE },
                     post?.title
                         ? { name: 'Latest post (baseline)', value: `[${post.title.slice(0, 100)}](${post.url})` }
                         : { name: 'Baseline', value: 'No posts found yet — will track from first post.' },
                 );
 
-                // If platform only has one type, skip the selector
+                // Single-type platforms (Kick, Twitter) skip the type-choice step entirely —
+                // there's only one kind of post, so go straight to a "set your message" button.
                 if (types.length <= 1) {
-                    await interaction.editReply({ embeds: [successEmbed] });
+                    successEmbed.setDescription('One more step — set the notification message below.');
+                    const msgRow = new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}`).setLabel('Set Message').setStyle(ButtonStyle.Primary)
+                    );
+                    await interaction.editReply({ embeds: [successEmbed], components: [msgRow] });
                     return;
                 }
 
-                // Show notification type selector
+                // Multi-type platforms: choose notification types first — selecting (or skipping)
+                // chains straight into the per-type message form, so this is a single guided path
+                // instead of separate optional buttons.
                 const typeEmbed = new EmbedBuilder().setColor('#5865F2')
                     .setTitle(`${p.emoji} Choose Notification Types`)
-                    .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below. You can change this later via \`/social list\`.`);
+                    .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`);
                 const typeRow = new ActionRowBuilder().addComponents(
                     new StringSelectMenuBuilder()
-                        .setCustomId(`socialtype_select_${watch.id}`)
+                        .setCustomId(`socialtypeadd_select_${watch.id}`)
                         .setPlaceholder('Select notification types…')
                         .setMinValues(1).setMaxValues(types.length)
                         .addOptions(types.map(t => ({ label: t.label, value: t.id, description: t.description })))
                 );
                 const skipRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`socialtype_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
+                    new ButtonBuilder().setCustomId(`socialtypeadd_skip_${watch.id}`).setLabel('All types (skip)').setStyle(ButtonStyle.Secondary)
                 );
                 await interaction.editReply({ embeds: [successEmbed, typeEmbed], components: [typeRow, skipRow] });
                 return;
@@ -797,40 +1013,10 @@ client.on('interactionCreate', async interaction => {
                 return interaction.editReply('✅ Checked all tracked accounts for new posts.');
             }
 
-            if (sub === 'debug') {
-                await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-                const id = interaction.options.getInteger('id');
-                const watches = await getWatches(guildId);
-                const w = watches.find(x => x.id === id);
-                if (!w) return interaction.editReply(`❌ No watch with ID \`${id}\` in this server. Use \`/social list\` to see IDs.`);
-
-                let post = null, fetchError = null;
-                try { post = await fetchLatestPost(w.platform, w.handle); }
-                catch (e) { fetchError = e.message; }
-
-                const embed = E('#5865F2', `Debug — ${PLATFORMS[w.platform].label} ${w.handle}`)
-                    .addFields(
-                        { name: 'Most recent post ID', value: w.last_post_id ? `\`${w.last_post_id}\`` : '*(none yet)*' },
-                        { name: 'Recently seen IDs', value: Array.isArray(w.seen_post_ids) && w.seen_post_ids.length ? w.seen_post_ids.slice(0, 10).map(id => `\`${id}\``).join(', ') : '*(none yet)*' },
-                        { name: 'Last checked', value: w.last_checked ? `<t:${Math.floor(w.last_checked / 1000)}:R>` : '*(never)*' },
-                    );
-                if (fetchError) {
-                    embed.addFields({ name: 'Live fetch', value: `❌ Error: ${fetchError}` }).setColor('#ff0000');
-                } else if (!post) {
-                    embed.addFields({ name: 'Live fetch', value: '⚠️ Returned no post (account empty or unparsable).' });
-                } else {
-                    const alreadySeen = Array.isArray(w.seen_post_ids) && w.seen_post_ids.includes(post.id);
-                    embed.addFields(
-                        { name: 'Live fetch — latest post ID', value: `\`${post.id}\`` },
-                        { name: 'Already notified for this?', value: alreadySeen ? '✅ Yes — no notification will fire' : '🆕 New — notification should fire on next poll/check' },
-                        { name: 'Live post', value: post.title ? `[${post.title.slice(0, 150)}](${post.url})` : (post.url || 'N/A') },
-                    );
-                }
-                return interaction.editReply({ embeds: [embed] });
-            }
         }
         return;
     }
+
 
     // ── Role select: access role ──────────────────────────────────────────
     if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('social_access_role_')) {
@@ -948,6 +1134,25 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // ── Select/skip: notification types from the guided /social add flow —
+    // chains straight into the per-type message modal instead of just confirming.
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialtypeadd_select_')) {
+        const id = parseInt(interaction.customId.slice(21), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
+        await updateWatchNotifyTypes(guildId, id, interaction.values);
+        const updated = await getWatch(guildId, id);
+        return interaction.showModal(buildPerTypeMessageModal(updated));
+    }
+    if (interaction.isButton() && interaction.customId.startsWith('socialtypeadd_skip_')) {
+        const id = parseInt(interaction.customId.slice(19), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.update({ content: '❌ Watch not found.', embeds: [], components: [] });
+        await updateWatchNotifyTypes(guildId, id, null);
+        const updated = await getWatch(guildId, id);
+        return interaction.showModal(buildPerTypeMessageModal(updated));
+    }
+
     // ── Select: notification types (post-add and manage flows) ──────────────
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith('socialtype_select_')) {
         const id = parseInt(interaction.customId.slice(18), 10);
@@ -1015,6 +1220,34 @@ client.on('interactionCreate', async interaction => {
         return interaction.editReply({ embeds, components });
     }
 
+    // ── Button: open per-post-type custom message popup form ────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('socialpertype_open_')) {
+        const id = parseInt(interaction.customId.slice(19), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        return interaction.showModal(buildPerTypeMessageModal(w));
+    }
+
+    // ── Modal: save per-post-type custom messages ────────────────────────────
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('socialpertype_modal_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const id = parseInt(interaction.customId.slice(20), 10);
+        const w = await getWatch(guildId, id);
+        if (!w) return interaction.reply({ content: '❌ Watch not found.', flags: [MessageFlags.Ephemeral] });
+        const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
+        const updatedTemplates = {};
+        for (const t of types.slice(0, 5)) {
+            const val = interaction.fields.getTextInputValue(`tmpl_${t.id}`).trim();
+            if (val) updatedTemplates[t.id] = val;
+        }
+        await updateWatchMessageTemplates(guildId, id, updatedTemplates);
+        await interaction.deferUpdate();
+        const updated = await getWatch(guildId, id);
+        const { embeds, components } = buildManageView(updated);
+        return interaction.editReply({ embeds, components });
+    }
+
   } catch (error) {
       if (error?.code === 40060) return;
       console.error('❌ Interaction error:', error);
@@ -1032,14 +1265,106 @@ client.on('interactionCreate', async interaction => {
     } catch (e) {
         console.error('⚠️ initDB failed, starting bot anyway:', e.message);
     }
-    await client.login(process.env.DISCORD_TOKEN);
+    if (!process.env.DISCORD_TOKEN || !process.env.DISCORD_TOKEN.trim()) {
+        console.error('❌ DISCORD_TOKEN is missing or empty. Set it in this service\'s environment variables and redeploy.');
+        process.exit(1);
+    }
+    try {
+        await client.login(process.env.DISCORD_TOKEN.trim());
+    } catch (e) {
+        console.error('❌ Discord login failed:', e.message, '\nDouble-check DISCORD_TOKEN on this service — copy it fresh from the Developer Portal with no extra whitespace/quotes.');
+        process.exit(1);
+    }
 })();
 
 process.on('unhandledRejection', e => console.error('⚠️ Unhandled rejection:', e));
 client.on('error', e => console.error('⚠️ Discord client error:', e));
 
+function legalPage(title, bodyHtml) {
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title} — Notifyer</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#1a1a1a;} h1{margin-bottom:4px;} .updated{color:#666;font-size:0.9em;margin-top:0;} h2{margin-top:28px;} a{color:#5865F2;}</style>
+</head><body>${bodyHtml}</body></html>`;
+}
+
+const LEGAL_LAST_UPDATED = 'August 29, 2026';
+const LEGAL_CONTACT = process.env.LEGAL_CONTACT_EMAIL || process.env.BOT_OWNER_DISCORD_TAG || 'the bot owner via the support server';
+
+const TERMS_HTML = legalPage('Terms of Service', `
+<h1>Terms of Service</h1>
+<p class="updated">Last updated: ${LEGAL_LAST_UPDATED}</p>
+<p>These Terms govern your use of the Notifyer Discord bot ("the Bot"). By adding the Bot to a server or using its commands, you agree to these Terms.</p>
+
+<h2>What the Bot does</h2>
+<p>The Bot watches accounts you configure on YouTube, Twitter/X, Twitch, and Kick, and posts a notification in a Discord channel you choose when those accounts publish new content or go live.</p>
+
+<h2>Acceptable use</h2>
+<ul>
+<li>You must comply with Discord's <a href="https://discord.com/terms">Terms of Service</a> and <a href="https://discord.com/guidelines">Community Guidelines</a> while using the Bot.</li>
+<li>Don't use the Bot to spam, harass, or send notifications to channels/servers without appropriate permission.</li>
+<li>Don't attempt to abuse, overload, or reverse-engineer the Bot's infrastructure.</li>
+</ul>
+
+<h2>No warranty</h2>
+<p>The Bot is provided "as is," without warranty of any kind. Notifications may be delayed, missed, or occasionally inaccurate, particularly where the Bot relies on unofficial or rate-limited data sources (e.g. Twitter). We don't guarantee uninterrupted availability.</p>
+
+<h2>Limitation of liability</h2>
+<p>To the maximum extent permitted by law, the Bot's operator is not liable for any indirect, incidental, or consequential damages arising from your use of, or inability to use, the Bot.</p>
+
+<h2>Termination</h2>
+<p>We may suspend or terminate the Bot's access to your server, or discontinue the Bot entirely, at any time. You can remove the Bot from your server at any time via Discord's server settings.</p>
+
+<h2>Changes</h2>
+<p>We may update these Terms from time to time. Continued use of the Bot after changes are posted constitutes acceptance of the revised Terms.</p>
+
+<h2>Contact</h2>
+<p>Questions about these Terms can be directed to ${LEGAL_CONTACT}.</p>
+`);
+
+const PRIVACY_HTML = legalPage('Privacy Policy', `
+<h1>Privacy Policy</h1>
+<p class="updated">Last updated: ${LEGAL_LAST_UPDATED}</p>
+<p>This Privacy Policy explains what data the Notifyer Discord bot ("the Bot") collects and how it's used.</p>
+
+<h2>Data we collect</h2>
+<ul>
+<li><b>Server configuration:</b> the Discord server (guild) ID, channel IDs, role IDs, and the account handles/URLs you choose to track, along with any custom notification message templates you set.</li>
+<li><b>Discord identifiers:</b> the Discord user ID and username of whoever adds a watch, stored only to show who configured something.</li>
+<li><b>Post metadata:</b> IDs and timestamps of posts already seen, so the Bot doesn't re-notify for the same content.</li>
+</ul>
+<p>We do not collect message content from your Discord server beyond what's needed to operate slash commands, and we do not read or store the content of DMs.</p>
+
+<h2>How we use data</h2>
+<p>Data is used solely to operate the Bot's core function: checking tracked accounts on a schedule and posting notifications to the channel you specify. We do not sell data, use it for advertising, or share it with third parties except the platform APIs (YouTube, Twitter/X, Twitch, Kick) strictly as needed to check for new content.</p>
+
+<h2>Data retention & deletion</h2>
+<p>Watch configurations and linked accounts are retained until you remove them (<code>/social list</code> → Remove, or by revoking a link) or remove the Bot from your server. You can request deletion of any data tied to your server or Discord account by contacting ${LEGAL_CONTACT}.</p>
+
+<h2>Third-party services</h2>
+<p>The Bot communicates with Discord's API, and — where you've configured it — YouTube, Twitter/X, Twitch, and Kick's APIs. Each of those platforms has its own privacy policy governing data you share with them directly.</p>
+
+<h2>Security</h2>
+<p>Stored data lives in a private database and is not exposed through any Bot command or public endpoint. No storage method is 100% secure, but we take reasonable steps to protect stored data.</p>
+
+<h2>Children's privacy</h2>
+<p>The Bot is not directed at children under 13, consistent with Discord's own age requirements.</p>
+
+<h2>Changes</h2>
+<p>We may update this Privacy Policy from time to time. Material changes will be reflected by updating the "Last updated" date above.</p>
+
+<h2>Contact</h2>
+<p>Questions about this policy, or requests to access/delete your data, can be directed to ${LEGAL_CONTACT}.</p>
+`);
+
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => { const ok = req.url === '/' || req.url === '/health'; res.writeHead(ok ? 200 : 404, { 'Content-Type': 'text/plain' }); res.end(ok ? 'Social notify bot is running!' : 'Not found'); }).listen(PORT, () => console.log(`🌐 HTTP server on port ${PORT}`));
+http.createServer((req, res) => {
+    const path = req.url.split('?')[0];
+    if (path === '/' || path === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('Social notify bot is running!');
+    }
+    if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
+    if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
+    res.writeHead(404, { 'Content-Type': 'text/plain' }); res.end('Not found');
+}).listen(PORT, () => console.log(`🌐 HTTP server on port ${PORT}`));
 
 // Keep-alive: ping our own URL periodically so Render's free tier doesn't spin down.
 const KEEP_ALIVE_URL = process.env.RENDER_EXTERNAL_URL || process.env.KEEP_ALIVE_URL;
