@@ -819,16 +819,56 @@ function buildManageView(w) {
     return { embeds: [embed], components: [row1, row2] };
 }
 
-const helpEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Social Notify Bot')
-    .setDescription('Get notified in a channel whenever a tracked account posts new content.')
-    .addFields(
-        { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel — you\'ll then choose notification types and set the message.' },
-        { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
-        { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
-        { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
-        { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
-        { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
+// ── Help (tabbed) ────────────────────────────────────────────────────────
+const HELP_CATEGORIES = [
+    {
+        id: 'general', emoji: '🏠', label: 'General',
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer — General')
+            .setDescription('Get notified in a channel whenever a tracked account posts new content or goes live.')
+            .addFields(
+                { name: '/help', value: 'Shows this menu.' },
+                { name: '/invite', value: 'Get a link to invite this bot to another server.' },
+            ),
+    },
+    {
+        id: 'tracking', emoji: '📡', label: 'Tracking',
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer — Tracking')
+            .addFields(
+                { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel — you\'ll then choose notification types and set the message.' },
+                { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
+                { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
+            ),
+    },
+    {
+        id: 'settings', emoji: '⚙️', label: 'Settings',
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer — Settings')
+            .addFields(
+                { name: '/social access', value: 'Set which role (besides admins) can manage social notifications in this server. Same as /config access.' },
+                { name: '/config access', value: 'Alias of /social access.' },
+            ),
+    },
+    {
+        id: 'info', emoji: 'ℹ️', label: 'Info',
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer — Info')
+            .addFields(
+                { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emoji} ${p.label}`).join('  ·  ') },
+                { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
+                { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
+                { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
+            ),
+    },
+];
+function buildHelpView(activeId) {
+    const active = HELP_CATEGORIES.find(c => c.id === activeId) || HELP_CATEGORIES[0];
+    const row = new ActionRowBuilder().addComponents(
+        HELP_CATEGORIES.map(c => new ButtonBuilder()
+            .setCustomId(`help_cat_${c.id}`)
+            .setLabel(c.label)
+            .setEmoji(c.emoji)
+            .setStyle(c.id === active.id ? ButtonStyle.Primary : ButtonStyle.Secondary))
     );
+    return { embeds: [active.build()], components: [row] };
+}
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
 client.once('ready', async () => {
@@ -903,7 +943,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (commandName === 'help') {
-            return reply({ embeds: [helpEmbed()], flags: [MessageFlags.Ephemeral] });
+            return reply({ ...buildHelpView('general'), flags: [MessageFlags.Ephemeral] });
         }
 
         if (commandName === 'config' || commandName === 'social') {
@@ -1025,6 +1065,12 @@ client.on('interactionCreate', async interaction => {
         const cfg = await getConfig(guildId);
         cfg.accessRoleId = role; saveConfig(guildId, cfg);
         return interaction.update({ embeds: [E('#00ff00', '✅ Access Updated').setDescription(`<@&${role}> can now manage social notifications.`)], components: [] });
+    }
+
+    // ── Buttons: /help category tabs ─────────────────────────────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('help_cat_')) {
+        const catId = interaction.customId.slice(9);
+        return interaction.update(buildHelpView(catId));
     }
 
     // ── Buttons: refresh list ───────────────────────────────────────────────
@@ -1355,11 +1401,21 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 <p>Questions about this policy, or requests to access/delete your data, can be directed to ${LEGAL_CONTACT}.</p>
 `);
 
+const STATUS_HTML = legalPage('Status', `
+<h1>🔔 Notifyer</h1>
+<p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>
+<p>This is the backend for a Discord bot that posts notifications in a server channel whenever a tracked creator publishes new content or goes live.</p>
+<p><a href="/terms">Terms of Service</a> &nbsp;·&nbsp; <a href="/privacy">Privacy Policy</a></p>
+`);
+
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     const path = req.url.split('?')[0];
-    if (path === '/' || path === '/health') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('Social notify bot is running!');
+    if (path === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('OK');
+    }
+    if (path === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(STATUS_HTML);
     }
     if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
     if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
