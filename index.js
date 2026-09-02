@@ -843,8 +843,7 @@ const HELP_CATEGORIES = [
         id: 'settings', emoji: '⚙️', label: 'Settings',
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer — Settings')
             .addFields(
-                { name: '/social access', value: 'Set which role (besides admins) can manage social notifications in this server. Same as /config access.' },
-                { name: '/config access', value: 'Alias of /social access.' },
+                { name: '/social access', value: 'Set which role (besides admins) can manage social notifications in this server.' },
             ),
     },
     {
@@ -855,6 +854,7 @@ const HELP_CATEGORIES = [
                 { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
                 { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
+                { name: 'Links', value: `[GitHub](https://github.com/DaniBottoni/Notifyer/tree/main) • [top.gg](https://top.gg/bot/1515779889737896006)` },
             ),
     },
 ];
@@ -885,8 +885,6 @@ client.once('ready', async () => {
                 .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
             .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
             .addSubcommand(s => s.setName('check').setDescription('Force an immediate check of all tracked accounts'))
-            .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
-        new SlashCommandBuilder().setName('config').setDescription('Configure the bot')
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
     ];
     await client.application.commands.set(commands).catch(e => console.error('command registration:', e));
@@ -946,10 +944,10 @@ client.on('interactionCreate', async interaction => {
             return reply({ ...buildHelpView('general'), flags: [MessageFlags.Ephemeral] });
         }
 
-        if (commandName === 'config' || commandName === 'social') {
+        if (commandName === 'social') {
             const sub = interaction.options.getSubcommand();
 
-            if (sub === 'access' && (commandName === 'config' || commandName === 'social')) {
+            if (sub === 'access') {
                 if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return reply('❌ Only administrators can change access settings.');
                 await interaction.reply({
                     embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('🔒 Access Configuration').setDescription('Select which role should have access to `/social` commands.\n\n**Note:** Server administrators always have access.').setFooter({ text: 'Select a role from the dropdown below' })],
@@ -1405,7 +1403,12 @@ const STATUS_HTML = legalPage('Status', `
 <h1>🔔 Notifyer</h1>
 <p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>
 <p>This is the backend for a Discord bot that posts notifications in a server channel whenever a tracked creator publishes new content or goes live.</p>
-<p><a href="/terms">Terms of Service</a> &nbsp;·&nbsp; <a href="/privacy">Privacy Policy</a></p>
+<p>
+<a href="/terms">Terms of Service</a> &nbsp;·&nbsp;
+<a href="/privacy">Privacy Policy</a> &nbsp;·&nbsp;
+<a href="https://github.com/DaniBottoni/Notifyer/tree/main">GitHub</a> &nbsp;·&nbsp;
+<a href="https://top.gg/bot/1515779889737896006">top.gg</a>
+</p>
 `);
 
 const PORT = process.env.PORT || 3000;
