@@ -82,10 +82,28 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 
 const PLATFORMS = {
     youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
-    twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
+    // Twitter/X is flagged unavailable — Nitter (the public mirrors this bot reads
+    // through) was shut down by an X Corp cease-and-desist in Aug 2026. See the
+    // in-app warning shown to servers with existing Twitter watches for details.
+    twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2', unavailable: true },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF' },
     kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18' },
 };
+
+// Custom (application) emoji support — optional. Upload each platform's icon as an
+// application emoji (Discord Developer Portal → your app → Emojis, or the API —
+// these work in every server the bot is in, no per-guild upload needed), then set
+// EMOJI_<PLATFORM>_ID (and EMOJI_<PLATFORM>_NAME if it's not just the platform key)
+// as env vars, e.g. EMOJI_YOUTUBE_ID=123456789012345678. Leave unset to keep using
+// the plain Unicode emoji above — nothing breaks either way.
+// p.emojiTag   → for embed/text display, e.g. `${p.emojiTag} ${p.label}`
+// p.emojiButton → for ButtonBuilder.setEmoji(p.emojiButton)
+for (const [key, p] of Object.entries(PLATFORMS)) {
+    const id = process.env[`EMOJI_${key.toUpperCase()}_ID`];
+    const name = process.env[`EMOJI_${key.toUpperCase()}_NAME`] || key;
+    p.emojiTag = id ? `<:${name}:${id}>` : p.emoji;
+    p.emojiButton = id ? { id, name } : p.emoji;
+}
 
 // Notification types per platform. Each watch stores a subset of these in `notify_types` (JSONB array).
 // If null/empty, all types fire (default behaviour / backwards compat).
@@ -214,6 +232,40 @@ async function announceSupportServer(guild) {
     } catch (e) {
         console.error(`announceSupportServer (${guild.id}):`, e.message);
     }
+}
+
+// One-time (per guild) heads-up that Twitter/X tracking is currently non-functional,
+// sent to an admin-looking channel so server staff aren't left wondering why Twitter
+// watches never fire. Gated by a flag in `configs` so it only ever sends once per guild
+// regardless of how many times the bot restarts or how many Twitter watches get added.
+async function warnTwitterOutageForGuild(guildId) {
+    try {
+        const cfg = await getConfig(guildId);
+        if (cfg.twitterOutageWarned) return;
+        const guild = client.guilds.cache.get(guildId);
+        if (!guild) return;
+        const channel = findAnnouncementChannel(guild);
+        if (!channel) return;
+        const embed = new EmbedBuilder().setColor('#FFA500').setTitle('⚠️ Twitter/X tracking is currently down')
+            .setDescription(
+                'This server has one or more Twitter/X watches, but Twitter/X notifications aren\'t working right now.\n\n' +
+                'This bot reads X posts through public Nitter mirrors (there\'s no free official X API). ' +
+                'X Corp sent legal cease-and-desist letters to the Nitter project in August 2026, and every public mirror has since gone offline.\n\n' +
+                'Your other tracked platforms (YouTube, Twitch, Kick) are unaffected. Twitter/X watches will start working again automatically if a mirror ever comes back online — no action needed on your end.'
+            );
+        await channel.send({ embeds: [embed] }).catch(e => console.error(`twitter outage warning send (${guildId}):`, e.message));
+        saveConfig(guildId, { ...cfg, twitterOutageWarned: true });
+        console.log(`⚠️ Sent Twitter outage warning to ${guild.name} (#${channel.name})`);
+    } catch (e) {
+        console.error(`warnTwitterOutageForGuild (${guildId}):`, e.message);
+    }
+}
+
+// Boot-time sweep for guilds that already have Twitter watches from before this warning existed.
+async function warnTwitterBrokenGuilds() {
+    const watches = await getAllWatches();
+    const guildIdsWithTwitter = [...new Set(watches.filter(w => w.platform === 'twitter').map(w => w.guild_id))];
+    for (const guildId of guildIdsWithTwitter) await warnTwitterOutageForGuild(guildId);
 }
 
 async function getWatches(guildId) {
@@ -603,7 +655,11 @@ function renderTemplate(template, post, platform, handle) {
 }
 
 // ── Polling loop ───────────────────────────────────────────────────────────
-const PLATFORM_MIN_INTERVAL_MS = {};
+// Twitter/X relies on public Nitter mirrors, which X Corp had legally shut down via
+// cease-and-desist (Aug 2026) — every mirror currently returns nothing but errors/429s.
+// Checking every 2 minutes like other platforms just hammers dead endpoints for nothing,
+// so Twitter backs off to a much longer interval until (if ever) a mirror comes back.
+const PLATFORM_MIN_INTERVAL_MS = { twitter: 30 * 60 * 1000 };
 
 function shouldNotify(w, post) {
     const types = Array.isArray(w.notify_types) && w.notify_types.length ? w.notify_types : null;
@@ -640,7 +696,7 @@ async function sendNotification(w, post) {
     if (wantsNativeVideo && !content.includes(post.url)) content = `${content}\n${post.url}`;
     if (w.role_id) content = `<@&${w.role_id}> ${content}`;
     const linkRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emoji)
+        new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emojiButton)
     );
     if (wantsNativeVideo) {
         // Discord's native video unfurl (from the raw URL above) already shows the title,
@@ -739,6 +795,16 @@ async function buildWatchListEmbed(guildId) {
         .setDescription(`Tracking **${watches.length}** account${watches.length > 1 ? 's' : ''}.`);
     for (const w of watches.slice(0, 25)) {
         const p = PLATFORMS[w.platform];
+        if (!p) {
+            // Leftover watch for a platform this build no longer supports (e.g. Instagram/TikTok
+            // removed from the release build). Show it so it's discoverable/removable instead of crashing.
+            embed.addFields({
+                name: `⚠️ ${w.handle} — unsupported platform (${w.platform})`,
+                value: `ID: \`${w.id}\` — this platform isn't supported by this build anymore. Select it below and hit Remove.`,
+                inline: false,
+            });
+            continue;
+        }
         const lines = [
             `Posts to <#${w.channel_id}>`,
             `ID: \`${w.id}\``,
@@ -746,8 +812,19 @@ async function buildWatchListEmbed(guildId) {
         ];
         if (w.role_id) lines.push(`Ping: <@&${w.role_id}>`);
         if (!w.active) lines.push('⏸️ Paused');
+        if (p.unavailable) {
+            // "Greyed out" look — embeds can't apply literal text color, so we use the
+            // smaller/dimmer subtext style plus a clear label instead.
+            lines.push(`-# ⚠️ ${p.label} is currently unavailable — see \`/help\` → Info for why.`);
+            embed.addFields({
+                name: `${p.emojiTag} ${p.label} — ${w.handle} *(unavailable)*${w.active ? '' : ' (paused)'}`,
+                value: lines.join('\n'),
+                inline: false,
+            });
+            continue;
+        }
         embed.addFields({
-            name: `${p.emoji} ${p.label} — ${w.handle}${w.active ? '' : ' (paused)'}`,
+            name: `${p.emojiTag} ${p.label} — ${w.handle}${w.active ? '' : ' (paused)'}`,
             value: lines.join('\n'),
             inline: false,
         });
@@ -756,7 +833,10 @@ async function buildWatchListEmbed(guildId) {
     const components = [
         new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`sociallist_manage_${guildId}`).setPlaceholder('Manage a watch…')
-                .addOptions(watches.slice(0, 25).map(w => ({ label: `${PLATFORMS[w.platform].label} — ${w.handle}`.slice(0, 100), value: `${w.id}` })))
+                .addOptions(watches.slice(0, 25).map(w => ({
+                    label: `${PLATFORMS[w.platform]?.label || `⚠️ ${w.platform}`}${PLATFORMS[w.platform]?.unavailable ? ' (unavailable)' : ''} — ${w.handle}`.slice(0, 100),
+                    value: `${w.id}`,
+                })))
         ),
         new ActionRowBuilder().addComponents(refreshBtn(`sociallist_refresh_${guildId}`)),
     ];
@@ -789,10 +869,21 @@ function buildPerTypeMessageModal(w) {
 
 function buildManageView(w) {
     const p = PLATFORMS[w.platform];
+    if (!p) {
+        // Orphaned watch for a platform this build no longer supports — offer just Remove.
+        const embed = new EmbedBuilder().setColor('#ED4245').setTitle(`⚠️ Unsupported platform — ${w.handle}`)
+            .setDescription(`This watch is for **${w.platform}**, which isn't supported by this bot build anymore. Nothing else can be edited — remove it below.`)
+            .addFields({ name: 'Channel', value: `<#${w.channel_id}>`, inline: true }, { name: 'ID', value: `\`${w.id}\``, inline: true });
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`socialmanage_remove_${w.id}`).setLabel('Remove').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(`socialmanage_back_${w.guild_id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
+        );
+        return { embeds: [embed], components: [row] };
+    }
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
     const templates = w.message_templates || {};
     const perTypeLines = types.filter(t => templates[t.id]).map(t => `**${t.label}:** \`${templates[t.id].slice(0, 80)}\``);
-    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emoji} ${w.handle}`).setTimestamp()
+    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emojiTag} ${w.handle}`).setTimestamp()
         .addFields(
             { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
             { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },
@@ -801,6 +892,9 @@ function buildManageView(w) {
             { name: 'Default message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
         );
     if (perTypeLines.length) embed.addFields({ name: 'Per-type message overrides', value: perTypeLines.join('\n') });
+    if (p.unavailable) {
+        embed.addFields({ name: '⚠️ Currently unavailable', value: `${p.label} isn't working right now — see \`/help\` → Info for why. Notifications won't fire until this is resolved, but everything here stays saved.` });
+    }
     if (isLegacyMessageFormat(w)) {
         embed.addFields({ name: '⚠️ Outdated message', value: 'This message was auto-migrated from the old single-message format and hasn\'t been reviewed. It was written as one generic message and may not read well for every post type — check each type below (**Per-Type Messages**) and edit as needed.' });
     }
@@ -850,7 +944,8 @@ const HELP_CATEGORIES = [
         id: 'info', emoji: 'ℹ️', label: 'Info',
         build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer — Info')
             .addFields(
-                { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emoji} ${p.label}`).join('  ·  ') },
+                { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') },
+                { name: '⚠️ Twitter/X unavailable', value: 'This bot reads X posts through public Nitter mirrors. X Corp sent legal cease-and-desist letters to the Nitter project in August 2026, and every public mirror has since gone offline — so Twitter/X tracking currently doesn\'t work. Other platforms are unaffected, and this will resume automatically if a mirror ever comes back.' },
                 { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
                 { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
@@ -880,7 +975,7 @@ client.once('ready', async () => {
         new SlashCommandBuilder().setName('social').setDescription('Manage social media notifications')
             .addSubcommand(s => s.setName('add').setDescription('Track a new account')
                 .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
-                    .addChoices(...Object.entries(PLATFORMS).map(([k, v]) => ({ name: v.label, value: k }))))
+                    .addChoices(...Object.entries(PLATFORMS).filter(([, v]) => !v.unavailable).map(([k, v]) => ({ name: v.label, value: k }))))
                 .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
                 .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
             .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
@@ -906,6 +1001,9 @@ client.once('ready', async () => {
         }
         await new Promise(r => setTimeout(r, 1000)); // light stagger to avoid rate limits
     }
+
+    // One-time heads-up to servers with Twitter watches that X/Nitter is currently broken.
+    await warnTwitterBrokenGuilds();
 });
 
 client.on('guildCreate', async (guild) => {
@@ -961,6 +1059,9 @@ client.on('interactionCreate', async interaction => {
 
             if (sub === 'add') {
                 const platform = interaction.options.getString('platform');
+                if (PLATFORMS[platform]?.unavailable) {
+                    return reply(`❌ ${PLATFORMS[platform].label} is temporarily unavailable and can't be added right now (see \`/help\` → Info for details).`);
+                }
                 const rawHandle = interaction.options.getString('handle');
                 const channel = interaction.options.getChannel('channel');
                 const handle = normalizeHandle(platform, rawHandle);
@@ -997,11 +1098,12 @@ client.on('interactionCreate', async interaction => {
                 const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, addedBy: interaction.user.tag });
                 // Seed last_post_id so the first poll doesn't fire a notification for existing content
                 await updateLastPost(watch.id, post?.id || null);
+                if (platform === 'twitter') warnTwitterOutageForGuild(guildId).catch(() => {});
 
                 const p = PLATFORMS[platform];
                 const types = PLATFORM_NOTIFY_TYPES[platform];
                 const successEmbed = E('#00ff00', 'Now Tracking').addFields(
-                    { name: 'Platform', value: `${p.emoji} ${p.label}`, inline: true },
+                    { name: 'Platform', value: `${p.emojiTag} ${p.label}`, inline: true },
                     { name: 'Account', value: handle, inline: true },
                     { name: 'Channel', value: `${channel}`, inline: true },
                     post?.title
@@ -1024,7 +1126,7 @@ client.on('interactionCreate', async interaction => {
                 // chains straight into the per-type message form, so this is a single guided path
                 // instead of separate optional buttons.
                 const typeEmbed = new EmbedBuilder().setColor('#5865F2')
-                    .setTitle(`${p.emoji} Choose Notification Types`)
+                    .setTitle(`${p.emojiTag} Choose Notification Types`)
                     .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`);
                 const typeRow = new ActionRowBuilder().addComponents(
                     new StringSelectMenuBuilder()
@@ -1169,7 +1271,7 @@ client.on('interactionCreate', async interaction => {
         if (action === 'remove') {
             await removeWatch(guildId, id);
             const { embeds, components } = await buildWatchListEmbed(guildId);
-            return interaction.update({ content: `✅ Removed ${PLATFORMS[w.platform].label} — ${w.handle}.`, embeds, components });
+            return interaction.update({ content: `✅ Removed ${PLATFORMS[w.platform]?.label || w.platform} — ${w.handle}.`, embeds, components });
         }
 
         if (action === 'backto') {
@@ -1402,7 +1504,7 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 const STATUS_HTML = legalPage('Status', `
 <h1>🔔 Notifyer</h1>
 <p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>
-<p>This is the backend for Notifyer, the fast and free Discord notification bot. Below you can access important links. </p>
+<p>This is the backend for a Discord bot that posts notifications in a server channel whenever a tracked creator publishes new content or goes live.</p>
 <p>
 <a href="/terms">Terms of Service</a> &nbsp;·&nbsp;
 <a href="/privacy">Privacy Policy</a> &nbsp;·&nbsp;
