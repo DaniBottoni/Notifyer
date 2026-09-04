@@ -1789,7 +1789,8 @@ async function exchangeTikTokCode(code) {
         client_key: cfg.clientId, client_secret: cfg.clientSecret, code, grant_type: 'authorization_code', redirect_uri: cfg.redirectUri,
     });
     if (!json?.access_token) throw new Error(json?.error_description || 'TikTok token exchange failed');
-    const { json: userInfo } = await postJson('https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name', {}, { Authorization: `Bearer ${json.access_token}` });
+    // GET, not POST — the query string carries `fields`, there's no request body.
+    const { json: userInfo } = await fetchJson('https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name', { Authorization: `Bearer ${json.access_token}` });
     const username = userInfo?.data?.user?.display_name || json.open_id;
     return {
         externalUserId: json.open_id, externalUsername: username,
