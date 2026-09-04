@@ -15,11 +15,14 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTER
 const LEGAL_BASE_URL = PUBLIC_BASE_URL || 'https://your-app.onrender.com';
 const OAUTH_CONFIG = {
     instagram: {
+        // These come from Meta App Dashboard → your app → Instagram → "API setup with
+        // Instagram Login" → Business login settings — NOT the app's main Facebook App ID/Secret.
         clientId: process.env.INSTAGRAM_APP_ID,
         clientSecret: process.env.INSTAGRAM_APP_SECRET,
         redirectUri: `${PUBLIC_BASE_URL}/oauth/instagram/callback`,
-        authUrl: 'https://www.facebook.com/v21.0/dialog/oauth',
-        scope: 'instagram_basic,pages_show_list,instagram_manage_insights',
+        authUrl: 'https://www.instagram.com/oauth/authorize',
+        scope: 'instagram_business_basic',
+        clientIdParam: 'client_id', // standard OAuth naming
     },
     tiktok: {
         clientId: process.env.TIKTOK_CLIENT_KEY,
@@ -27,6 +30,10 @@ const OAUTH_CONFIG = {
         redirectUri: `${PUBLIC_BASE_URL}/oauth/tiktok/callback`,
         authUrl: 'https://www.tiktok.com/v2/auth/authorize/',
         scope: 'user.info.basic,video.list',
+        // TikTok deviates from standard OAuth naming: the authorize endpoint expects
+        // "client_key", not "client_id" — sending the wrong param name here produces
+        // errCode 10003 / error_type=client_key even with a correct, valid key.
+        clientIdParam: 'client_key',
     },
 };
 // In-memory pending OAuth states: state -> { guildId, userId, platform, expires }
@@ -145,12 +152,30 @@ const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 
 const PLATFORMS = {
     youtube:   { label: 'YouTube',   emoji: '▶️', color: '#FF0000' },
-    twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2' },
+    // Twitter/X is flagged unavailable — Nitter (the public mirrors this bot reads
+    // through) was shut down by an X Corp cease-and-desist in Aug 2026. See the
+    // in-app warning shown to servers with existing Twitter watches for details.
+    twitter:   { label: 'Twitter/X', emoji: '🐦', color: '#1DA1F2', unavailable: true },
     twitch:    { label: 'Twitch',    emoji: '🟣', color: '#9146FF' },
     kick:      { label: 'Kick',      emoji: '🟢', color: '#53FC18' },
     instagram: { label: 'Instagram', emoji: '📸', color: '#E1306C', oauth: true },
     tiktok:    { label: 'TikTok',    emoji: '🎵', color: '#010101', oauth: true },
 };
+
+// Custom (application) emoji support — optional. Upload each platform's icon as an
+// application emoji (Discord Developer Portal → your app → Emojis, or the API —
+// these work in every server the bot is in, no per-guild upload needed), then set
+// EMOJI_<PLATFORM>_ID (and EMOJI_<PLATFORM>_NAME if it's not just the platform key)
+// as env vars, e.g. EMOJI_YOUTUBE_ID=123456789012345678. Leave unset to keep using
+// the plain Unicode emoji above — nothing breaks either way.
+// p.emojiTag   → for embed/text display, e.g. `${p.emojiTag} ${p.label}`
+// p.emojiButton → for ButtonBuilder.setEmoji(p.emojiButton)
+for (const [key, p] of Object.entries(PLATFORMS)) {
+    const id = process.env[`EMOJI_${key.toUpperCase()}_ID`];
+    const name = process.env[`EMOJI_${key.toUpperCase()}_NAME`] || key;
+    p.emojiTag = id ? `<:${name}:${id}>` : p.emoji;
+    p.emojiButton = id ? { id, name } : p.emoji;
+}
 
 // Notification types per platform. Each watch stores a subset of these in `notify_types` (JSONB array).
 // If null/empty, all types fire (default behaviour / backwards compat).
@@ -723,10 +748,10 @@ async function ensureFreshToken(link) {
     if (!link.expires_at || link.expires_at - Date.now() > REFRESH_MARGIN_MS) return link;
 
     if (link.platform === 'instagram') {
-        const cfg = OAUTH_CONFIG.instagram;
-        // Long-lived Facebook user/page tokens are refreshed via a fresh fb_exchange_token call.
+        // Instagram User tokens (Instagram Login flow) refresh via graph.instagram.com directly —
+        // no app client_id/secret needed for this call, just the current valid long-lived token.
         const { json } = await fetchJson(
-            `https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${cfg.clientId}&client_secret=${cfg.clientSecret}&fb_exchange_token=${encodeURIComponent(link.access_token)}`
+            `https://graph.instagram.com/refresh_access_token?grant_type=ig_refresh_token&access_token=${encodeURIComponent(link.access_token)}`
         );
         if (!json?.access_token) throw new Error('Instagram token refresh failed — re-link with /social link.');
         const expiresAt = Date.now() + (json.expires_in ? json.expires_in * 1000 : 55 * 24 * 60 * 60 * 1000);
@@ -754,7 +779,7 @@ async function ensureFreshToken(link) {
 async function fetchLatestInstagramAll(link) {
     const fresh = await ensureFreshToken(link);
     const { json } = await fetchJson(
-        `https://graph.facebook.com/v21.0/${fresh.external_user_id}/media?fields=id,caption,media_type,media_product_type,media_url,permalink,timestamp&limit=10&access_token=${encodeURIComponent(fresh.access_token)}`
+        `https://graph.instagram.com/me/media?fields=id,caption,media_type,media_product_type,media_url,permalink,timestamp&limit=10&access_token=${encodeURIComponent(fresh.access_token)}`
     );
     if (json?.error) throw new Error(`Instagram API: ${json.error.message}`);
     const items = json?.data || [];
@@ -850,7 +875,7 @@ async function sendNotification(w, post) {
     if (wantsNativeVideo && !content.includes(post.url)) content = `${content}\n${post.url}`;
     if (w.role_id) content = `<@&${w.role_id}> ${content}`;
     const linkRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emoji)
+        new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emojiButton)
     );
     if (wantsNativeVideo) {
         // Discord's native video unfurl (from the raw URL above) already shows the title,
@@ -961,8 +986,19 @@ async function buildWatchListEmbed(guildId) {
         ];
         if (w.role_id) lines.push(`Ping: <@&${w.role_id}>`);
         if (!w.active) lines.push('⏸️ Paused');
+        if (p.unavailable) {
+            // "Greyed out" look — embeds can't apply literal text color, so we use the
+            // smaller/dimmer subtext style plus a clear label instead.
+            lines.push(`-# ⚠️ ${p.label} is currently unavailable — see \`/help\` → Info for why.`);
+            embed.addFields({
+                name: `${p.emojiTag} ${p.label} — ${w.handle} *(unavailable)*${w.active ? '' : ' (paused)'}`,
+                value: lines.join('\n'),
+                inline: false,
+            });
+            continue;
+        }
         embed.addFields({
-            name: `${p.emoji} ${p.label} — ${w.handle}${w.active ? '' : ' (paused)'}`,
+            name: `${p.emojiTag} ${p.label} — ${w.handle}${w.active ? '' : ' (paused)'}`,
             value: lines.join('\n'),
             inline: false,
         });
@@ -971,7 +1007,10 @@ async function buildWatchListEmbed(guildId) {
     const components = [
         new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`sociallist_manage_${guildId}`).setPlaceholder('Manage a watch…')
-                .addOptions(watches.slice(0, 25).map(w => ({ label: `${PLATFORMS[w.platform].label} — ${w.handle}`.slice(0, 100), value: `${w.id}` })))
+                .addOptions(watches.slice(0, 25).map(w => ({
+                    label: `${PLATFORMS[w.platform].label}${PLATFORMS[w.platform]?.unavailable ? ' (unavailable)' : ''} — ${w.handle}`.slice(0, 100),
+                    value: `${w.id}`,
+                })))
         ),
         new ActionRowBuilder().addComponents(refreshBtn(`sociallist_refresh_${guildId}`)),
     ];
@@ -1007,7 +1046,7 @@ function buildManageView(w) {
     const types = PLATFORM_NOTIFY_TYPES[w.platform] || [];
     const templates = w.message_templates || {};
     const perTypeLines = types.filter(t => templates[t.id]).map(t => `**${t.label}:** \`${templates[t.id].slice(0, 80)}\``);
-    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emoji} ${w.handle}`).setTimestamp()
+    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage — ${p.emojiTag} ${w.handle}`).setTimestamp()
         .addFields(
             { name: 'Channel', value: `<#${w.channel_id}>`, inline: true },
             { name: 'Status', value: w.active ? '▶️ Active' : '⏸️ Paused', inline: true },
@@ -1016,6 +1055,9 @@ function buildManageView(w) {
             { name: 'Default message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
         );
     if (perTypeLines.length) embed.addFields({ name: 'Per-type message overrides', value: perTypeLines.join('\n') });
+    if (p.unavailable) {
+        embed.addFields({ name: '⚠️ Currently unavailable', value: `${p.label} isn't working right now — see \`/help\` → Info for why. Notifications won't fire until this is resolved, but everything here stays saved.` });
+    }
     if (isLegacyMessageFormat(w)) {
         embed.addFields({ name: '⚠️ Outdated message', value: 'This message was auto-migrated from the old single-message format and hasn\'t been reviewed. It was written as one generic message and may not read well for every post type — check each type below (**Per-Type Messages**) and edit as needed.' });
     }
@@ -1034,16 +1076,77 @@ function buildManageView(w) {
     return { embeds: [embed], components: [row1, row2] };
 }
 
-const helpEmbed = () => new EmbedBuilder().setColor('#5865F2').setTitle('Social Notify Bot')
-    .setDescription('Get notified in a channel whenever a tracked account posts new content.')
-    .addFields(
-        { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel. Optionally set a custom message.' },
-        { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
-        { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
-        { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
-        { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
-        { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
-    );
+// ── Help (tabbed) ────────────────────────────────────────────────────────
+const HELP_CATEGORIES = [
+    {
+        id: 'general', emoji: '🏠', label: 'General',
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — General')
+            .setDescription('Get notified in a channel whenever a tracked account posts new content or goes live.')
+            .addFields(
+                { name: '/help', value: 'Shows this menu.' },
+                { name: '/invite', value: 'Get a link to invite this bot to another server.' },
+            ),
+    },
+    {
+        id: 'tracking', emoji: '📡', label: 'Tracking',
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Tracking')
+            .addFields(
+                { name: '/social add', value: 'Track a new account. Choose a platform, enter the handle/URL, and pick a channel — you\'ll then choose notification types and set the message. Instagram/TikTok accounts must be linked first (see the Linking tab).' },
+                { name: '/social list', value: 'View all tracked accounts. Pick one from the dropdown to manage it: edit message, change channel, set a ping role, pause/resume, or remove.' },
+                { name: '/social check', value: 'Force an immediate check of all tracked accounts.' },
+            ),
+    },
+    {
+        id: 'linking', emoji: '🔗', label: 'Linking',
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Linking')
+            .setDescription('Instagram and TikTok only expose their APIs through per-account OAuth consent — an account has to explicitly authorize this bot before it can be tracked.')
+            .addFields(
+                { name: '/social link', value: 'Connect an Instagram or TikTok account via OAuth so it can be tracked. Sends a link the account owner clicks and logs in with.' },
+                { name: '/social links', value: 'View accounts already linked via OAuth in this server.' },
+            ),
+    },
+    {
+        id: 'settings', emoji: '⚙️', label: 'Settings',
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Settings')
+            .addFields(
+                { name: '/social access', value: 'Set which role (besides admins) can manage social notifications in this server.' },
+            ),
+    },
+    {
+        id: 'info', emoji: 'ℹ️', label: 'Info',
+        build: () => new EmbedBuilder().setColor('#5865F2').setTitle('🔔 Notifyer Beta — Info')
+            .addFields(
+                { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') },
+                { name: '⚠️ Twitter/X unavailable', value: 'This bot reads X posts through public Nitter mirrors. X Corp sent legal cease-and-desist letters to the Nitter project in August 2026, and every public mirror has since gone offline — so Twitter/X tracking currently doesn\'t work. Other platforms are unaffected, and this will resume automatically if a mirror ever comes back.' },
+                { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
+                { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
+                { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
+                { name: 'Links', value: `[GitHub](https://github.com/DaniBottoni/Notifyer/tree/main) • [top.gg](https://top.gg/bot/1515779889737896006)` },
+            ),
+    },
+    {
+        id: 'admin', emoji: '🔧', label: 'Admin',
+        build: () => new EmbedBuilder().setColor('#ED4245').setTitle('🔔 Notifyer Beta — Admin')
+            .setDescription('These commands are gated to the bot owner (`BOT_OWNER_ID`) and mainly exist for debugging this beta build.')
+            .addFields(
+                { name: '/social debug', value: 'Show a watch\'s live fetch result vs its stored baseline, to check whether it\'d fire a notification.' },
+                { name: '/social oauthdebug', value: 'Show the exact OAuth config (client ID, redirect URI, scope, full authorize URL) currently being sent for a platform.' },
+                { name: '/killbot', value: 'Suspend the Render service to stop usage/billing. Falls back to crashing the process if RENDER_API_KEY/RENDER_SERVICE_ID aren\'t set.' },
+            ),
+    },
+];
+function buildHelpView(activeId) {
+    const active = HELP_CATEGORIES.find(c => c.id === activeId) || HELP_CATEGORIES[0];
+    const buttons = HELP_CATEGORIES.map(c => new ButtonBuilder()
+        .setCustomId(`help_cat_${c.id}`)
+        .setLabel(c.label)
+        .setEmoji(c.emoji)
+        .setStyle(c.id === active.id ? ButtonStyle.Primary : ButtonStyle.Secondary));
+    // Chunk into rows of up to 5 buttons (Discord's per-row limit)
+    const rows = [];
+    for (let i = 0; i < buttons.length; i += 5) rows.push(new ActionRowBuilder().addComponents(buttons.slice(i, i + 5)));
+    return { embeds: [active.build()], components: rows };
+}
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
 client.once('ready', async () => {
@@ -1055,7 +1158,7 @@ client.once('ready', async () => {
         new SlashCommandBuilder().setName('social').setDescription('Manage social media notifications')
             .addSubcommand(s => s.setName('add').setDescription('Track a new account')
                 .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
-                    .addChoices(...Object.entries(PLATFORMS).map(([k, v]) => ({ name: v.label, value: k }))))
+                    .addChoices(...Object.entries(PLATFORMS).filter(([, v]) => !v.unavailable).map(([k, v]) => ({ name: v.label, value: k }))))
                 .addStringOption(o => o.setName('handle').setDescription('Username, handle, or profile URL').setRequired(true))
                 .addChannelOption(o => o.setName('channel').setDescription('Channel to post notifications in').setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
             .addSubcommand(s => s.setName('list').setDescription('View tracked accounts'))
@@ -1069,8 +1172,6 @@ client.once('ready', async () => {
             .addSubcommand(s => s.setName('oauthdebug').setDescription('Owner only: show the exact OAuth config being sent to a platform')
                 .addStringOption(o => o.setName('platform').setDescription('Platform').setRequired(true)
                     .addChoices({ name: 'Instagram', value: 'instagram' }, { name: 'TikTok', value: 'tiktok' })))
-            .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
-        new SlashCommandBuilder().setName('config').setDescription('Configure the bot')
             .addSubcommand(s => s.setName('access').setDescription('Set which role can manage social notifications')),
         new SlashCommandBuilder().setName('killbot').setDescription('Owner only: suspend the Render service to stop usage'),
     ];
@@ -1128,13 +1229,13 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (commandName === 'help') {
-            return reply({ embeds: [helpEmbed()], flags: [MessageFlags.Ephemeral] });
+            return reply({ ...buildHelpView('general'), flags: [MessageFlags.Ephemeral] });
         }
 
-        if (commandName === 'config' || commandName === 'social') {
+        if (commandName === 'social') {
             const sub = interaction.options.getSubcommand();
 
-            if (sub === 'access' && (commandName === 'config' || commandName === 'social')) {
+            if (sub === 'access') {
                 if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) return reply('❌ Only administrators can change access settings.');
                 await interaction.reply({
                     embeds: [new EmbedBuilder().setColor('#5865F2').setTitle('🔒 Access Configuration').setDescription('Select which role should have access to `/social` commands.\n\n**Note:** Server administrators always have access.').setFooter({ text: 'Select a role from the dropdown below' })],
@@ -1148,6 +1249,9 @@ client.on('interactionCreate', async interaction => {
 
             if (sub === 'add') {
                 const platform = interaction.options.getString('platform');
+                if (PLATFORMS[platform]?.unavailable) {
+                    return reply(`❌ ${PLATFORMS[platform].label} is temporarily unavailable and can't be added right now (see \`/help\` → Info for details).`);
+                }
                 const rawHandle = interaction.options.getString('handle');
                 const channel = interaction.options.getChannel('channel');
                 const handle = normalizeHandle(platform, rawHandle);
@@ -1207,7 +1311,7 @@ client.on('interactionCreate', async interaction => {
                 const p = PLATFORMS[platform];
                 const types = PLATFORM_NOTIFY_TYPES[platform];
                 const successEmbed = E('#00ff00', 'Now Tracking').addFields(
-                    { name: 'Platform', value: `${p.emoji} ${p.label}`, inline: true },
+                    { name: 'Platform', value: `${p.emojiTag} ${p.label}`, inline: true },
                     { name: 'Account', value: handle, inline: true },
                     { name: 'Channel', value: `${channel}`, inline: true },
                     post?.title
@@ -1230,7 +1334,7 @@ client.on('interactionCreate', async interaction => {
                 // chains straight into the per-type message form, so this is a single guided path
                 // instead of separate optional buttons.
                 const typeEmbed = new EmbedBuilder().setColor('#5865F2')
-                    .setTitle(`${p.emoji} Choose Notification Types`)
+                    .setTitle(`${p.emojiTag} Choose Notification Types`)
                     .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`);
                 const typeRow = new ActionRowBuilder().addComponents(
                     new StringSelectMenuBuilder()
@@ -1310,7 +1414,7 @@ client.on('interactionCreate', async interaction => {
                     return reply('❌ PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL) isn\'t set, so OAuth redirects have nowhere to go. Ask the bot owner to configure it.');
                 }
                 const { state, expires } = createOAuthState(guildId, interaction.user.id, platform);
-                const authUrl = `${cfg.authUrl}?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
+                const authUrl = `${cfg.authUrl}?${cfg.clientIdParam}=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
                 const row = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setLabel(`Authorize with ${PLATFORMS[platform].label}`).setStyle(ButtonStyle.Link).setURL(authUrl)
                 );
@@ -1341,7 +1445,7 @@ client.on('interactionCreate', async interaction => {
                 const cfg = OAUTH_CONFIG[platform];
                 const maskedSecret = cfg.clientSecret ? `${cfg.clientSecret.slice(0, 4)}${'*'.repeat(Math.max(0, cfg.clientSecret.length - 8))}${cfg.clientSecret.slice(-4)}` : '(not set)';
                 const { state } = createOAuthState(guildId, interaction.user.id, platform);
-                const authUrl = `${cfg.authUrl}?client_id=${encodeURIComponent(cfg.clientId || '')}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
+                const authUrl = `${cfg.authUrl}?${cfg.clientIdParam}=${encodeURIComponent(cfg.clientId || '')}&redirect_uri=${encodeURIComponent(cfg.redirectUri)}&scope=${encodeURIComponent(cfg.scope)}&response_type=code&state=${state}`;
                 const embed = E('#5865F2', `OAuth Debug — ${PLATFORMS[platform].label}`).setDescription(
                     'This is exactly what the bot is sending right now, read live from environment variables — compare each value character-by-character against the platform\'s developer dashboard.'
                 ).addFields(
@@ -1355,7 +1459,7 @@ client.on('interactionCreate', async interaction => {
                 return reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
             }
         }
-        if (commandName === 'invite' || commandName === 'help' || commandName === 'config' || commandName === 'social') return;
+        if (commandName === 'invite' || commandName === 'help' || commandName === 'social') return;
     }
 
     if (interaction.isChatInputCommand() && interaction.commandName === 'killbot') {
@@ -1392,6 +1496,12 @@ client.on('interactionCreate', async interaction => {
         const cfg = await getConfig(guildId);
         cfg.accessRoleId = role; saveConfig(guildId, cfg);
         return interaction.update({ embeds: [E('#00ff00', '✅ Access Updated').setDescription(`<@&${role}> can now manage social notifications.`)], components: [] });
+    }
+
+    // ── Buttons: /help category tabs ─────────────────────────────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('help_cat_')) {
+        const catId = interaction.customId.slice(9);
+        return interaction.update(buildHelpView(catId));
     }
 
     // ── Buttons: refresh list ───────────────────────────────────────────────
@@ -1648,30 +1758,29 @@ process.on('unhandledRejection', e => console.error('⚠️ Unhandled rejection:
 client.on('error', e => console.error('⚠️ Discord client error:', e));
 
 // ── OAuth code exchange (called from the HTTP callback routes) ────────────
+// Uses the newer "Instagram API with Instagram Login" (launched July 2024) — unlike the
+// older Facebook Login flow, this does NOT require the account to be linked to a Facebook
+// Page. The account just needs to be an Instagram Business/Creator account.
 async function exchangeInstagramCode(code) {
     const cfg = OAUTH_CONFIG.instagram;
-    // 1. Exchange the auth code for a short-lived user access token.
-    const { json: tokenRes } = await postForm('https://graph.facebook.com/v21.0/oauth/access_token', {
-        client_id: cfg.clientId, client_secret: cfg.clientSecret, redirect_uri: cfg.redirectUri, code,
+    // 1. Exchange the auth code for a short-lived Instagram User access token.
+    const { json: tokenRes } = await postForm('https://api.instagram.com/oauth/access_token', {
+        client_id: cfg.clientId, client_secret: cfg.clientSecret, grant_type: 'authorization_code', redirect_uri: cfg.redirectUri, code,
     });
-    if (!tokenRes?.access_token) throw new Error(tokenRes?.error?.message || 'Instagram token exchange failed');
+    if (!tokenRes?.access_token) throw new Error(tokenRes?.error_message || tokenRes?.error?.message || 'Instagram token exchange failed');
 
     // 2. Exchange for a long-lived token (~60 days).
     const { json: longRes } = await fetchJson(
-        `https://graph.facebook.com/v21.0/oauth/access_token?grant_type=fb_exchange_token&client_id=${cfg.clientId}&client_secret=${cfg.clientSecret}&fb_exchange_token=${encodeURIComponent(tokenRes.access_token)}`
+        `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${cfg.clientSecret}&access_token=${encodeURIComponent(tokenRes.access_token)}`
     );
     const accessToken = longRes?.access_token || tokenRes.access_token;
-    const expiresIn = longRes?.expires_in || tokenRes.expires_in || 55 * 24 * 60 * 60;
+    const expiresIn = longRes?.expires_in || 60 * 24 * 60 * 60;
 
-    // 3. Find the user's Facebook Page(s) and the Instagram professional account linked to one.
-    // (Instagram's Graph API requires the IG account to be Business/Creator and linked to a Page.)
-    const { json: pages } = await fetchJson(`https://graph.facebook.com/v21.0/me/accounts?access_token=${encodeURIComponent(accessToken)}`);
-    const page = (pages?.data || []).find(p => p.instagram_business_account);
-    if (!page) throw new Error('No Instagram professional account found — the account must be Business/Creator and linked to a Facebook Page.');
-    const igUserId = page.instagram_business_account.id;
-    const { json: igProfile } = await fetchJson(`https://graph.facebook.com/v21.0/${igUserId}?fields=username&access_token=${encodeURIComponent(accessToken)}`);
+    // 3. Get the account's own ID + username directly — no Facebook Page lookup needed.
+    const { json: profile } = await fetchJson(`https://graph.instagram.com/me?fields=user_id,username&access_token=${encodeURIComponent(accessToken)}`);
+    if (!profile?.user_id) throw new Error('Could not fetch the Instagram profile — make sure it\'s a Business or Creator account.');
 
-    return { externalUserId: igUserId, externalUsername: igProfile?.username || igUserId, accessToken, refreshToken: null, expiresAt: Date.now() + expiresIn * 1000 };
+    return { externalUserId: profile.user_id, externalUsername: profile.username || profile.user_id, accessToken, refreshToken: null, expiresAt: Date.now() + expiresIn * 1000 };
 }
 
 async function exchangeTikTokCode(code) {
@@ -1797,11 +1906,26 @@ const PRIVACY_HTML = legalPage('Privacy Policy', `
 <p>Questions about this policy, or requests to access/delete your data, can be directed to ${LEGAL_CONTACT}.</p>
 `);
 
+const STATUS_HTML = legalPage('Status', `
+<h1>🔔 Notifyer Beta</h1>
+<p class="updated">Status: <strong style="color:#3ba55d">● Online</strong></p>
+<p>This is the backend for the beta build of a Discord bot that posts notifications in a server channel whenever a tracked creator publishes new content or goes live.</p>
+<p>
+<a href="/terms">Terms of Service</a> &nbsp;·&nbsp;
+<a href="/privacy">Privacy Policy</a> &nbsp;·&nbsp;
+<a href="https://github.com/DaniBottoni/Notifyer/tree/main">GitHub</a> &nbsp;·&nbsp;
+<a href="https://top.gg/bot/1515779889737896006">top.gg</a>
+</p>
+`);
+
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     const path = req.url.split('?')[0];
-    if (path === '/' || path === '/health') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('Social notify bot is running!');
+    if (path === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' }); return res.end('OK');
+    }
+    if (path === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(STATUS_HTML);
     }
     if (path === '/terms') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(TERMS_HTML); }
     if (path === '/privacy') { res.writeHead(200, { 'Content-Type': 'text/html' }); return res.end(PRIVACY_HTML); }
