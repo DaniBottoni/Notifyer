@@ -29,7 +29,9 @@ const OAUTH_CONFIG = {
         clientSecret: process.env.TIKTOK_CLIENT_SECRET,
         redirectUri: `${PUBLIC_BASE_URL}/oauth/tiktok/callback`,
         authUrl: 'https://www.tiktok.com/v2/auth/authorize/',
-        scope: 'user.info.basic,video.list',
+        // user.info.basic only grants display_name (the shown nickname) — the actual
+        // unique @username requires user.info.profile specifically.
+        scope: 'user.info.basic,user.info.profile,video.list',
         // TikTok deviates from standard OAuth naming: the authorize endpoint expects
         // "client_key", not "client_id" — sending the wrong param name here produces
         // errCode 10003 / error_type=client_key even with a correct, valid key.
@@ -1790,8 +1792,10 @@ async function exchangeTikTokCode(code) {
     });
     if (!json?.access_token) throw new Error(json?.error_description || 'TikTok token exchange failed');
     // GET, not POST — the query string carries `fields`, there's no request body.
-    const { json: userInfo } = await fetchJson('https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name', { Authorization: `Bearer ${json.access_token}` });
-    const username = userInfo?.data?.user?.display_name || json.open_id;
+    // `username` (needs user.info.profile scope) is the real @handle people type into
+    // /social add — display_name is just the shown nickname and often differs from it.
+    const { json: userInfo } = await fetchJson('https://open.tiktokapis.com/v2/user/info/?fields=open_id,display_name,username', { Authorization: `Bearer ${json.access_token}` });
+    const username = userInfo?.data?.user?.username || userInfo?.data?.user?.display_name || json.open_id;
     return {
         externalUserId: json.open_id, externalUsername: username,
         accessToken: json.access_token, refreshToken: json.refresh_token,
@@ -1800,8 +1804,8 @@ async function exchangeTikTokCode(code) {
 }
 
 function htmlResponse(res, status, title, message) {
-    res.writeHead(status, { 'Content-Type': 'text/html' });
-    res.end(`<!DOCTYPE html><html><head><title>${title}</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;"><h2>${title}</h2><p>${message}</p></body></html>`);
+    res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;"><h2>${title}</h2><p>${message}</p></body></html>`);
 }
 
 async function handleOAuthCallback(platform, req, res) {
@@ -1823,7 +1827,7 @@ async function handleOAuthCallback(platform, req, res) {
             accessToken: identity.accessToken, refreshToken: identity.refreshToken, expiresAt: identity.expiresAt,
             linkedBy: stateEntry.userId,
         });
-        return htmlResponse(res, 200, 'Linked!', `<b>${identity.externalUsername}</b> is now linked. You can close this tab and go back to Discord — use <code>/social add</code> to start tracking it.`);
+        return htmlResponse(res, 200, 'Linked!', `<b>${identity.externalUsername}</b> is now linked. You can close this tab and go back to Discord, then use <code>/social add</code> to start tracking it.`);
     } catch (e) {
         console.error(`OAuth callback (${platform}):`, e.message);
         return htmlResponse(res, 500, 'Link failed', `${e.message} — you can close this tab and try /social link again.`);
