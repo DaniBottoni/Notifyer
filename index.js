@@ -929,6 +929,58 @@ function buttonLabelFor(platform, post) {
 // raw URL appears in the message content (not just inside a custom embed).
 const NATIVE_VIDEO_PLATFORMS = new Set(['youtube', 'tiktok']);
 
+// Discord's own crawler frequently fails to unfurl tiktok.com links — missing
+// thumbnails, or sometimes no embed at all — especially with the official API's
+// share_url, which has per-request utm_* tracking params attached (so the same
+// video's URL is never quite identical twice, defeating Discord's unfurl cache).
+// tnktok.com (fxTikTok) is a well-known Discord-embed-fixer mirror that reliably
+// produces a playable video card. We only use it for the auto-unfurled URL in the
+// message body — the "Watch Video" button below still links to the real tiktok.com
+// URL, so people always land on TikTok itself when they click through.
+function embeddableUrl(platform, url) {
+    if (platform !== 'tiktok' || !url) return url;
+    try {
+        const u = new URL(url);
+        u.hostname = u.hostname.replace(/(^|\.)tiktok\.com$/i, '$1tnktok.com');
+        u.search = ''; // tracking params vary per fetch and aren't needed for the embed
+        return u.toString();
+    } catch {
+        return url;
+    }
+}
+
+// TikTok's public oEmbed endpoint — no auth needed, just the canonical video URL.
+// Used only as a fallback when Discord's own crawler fails to unfurl the link.
+async function fetchTikTokOEmbed(url) {
+    const { status, json } = await fetchJson(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`);
+    if (status !== 200 || !json) return null;
+    return { title: json.title || null, thumbnail: json.thumbnail_url || null, author: json.author_name || null };
+}
+
+// Discord unfurls links asynchronously after the message is sent, and — even with the
+// tnktok.com mirror trick above — sometimes just fails to attach an embed at all (crawler
+// timeout, mirror hiccup, etc.), leaving a bare link with no visual. This checks back a few
+// seconds later and, if nothing got attached, patches the message with a manual embed built
+// from TikTok's own oEmbed API so there's always a visual card, playable or not.
+async function ensureVideoEmbedFallback(channel, messageId, post) {
+    await new Promise(r => setTimeout(r, 7000));
+    try {
+        const msg = await channel.messages.fetch(messageId).catch(() => null);
+        if (!msg || msg.embeds.length > 0) return; // unfurled fine (or message is gone) — nothing to do
+        const oembed = await fetchTikTokOEmbed(post.url).catch(() => null);
+        const fallback = new EmbedBuilder()
+            .setColor(PLATFORMS.tiktok.color)
+            .setAuthor({ name: `${oembed?.author || post.author || ''} • TikTok`.replace(/^ • /, '') })
+            .setURL(post.url)
+            .setDescription(oembed?.title || post.title || null)
+            .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
+        if (oembed?.thumbnail) fallback.setImage(oembed.thumbnail);
+        await msg.edit({ embeds: [fallback] }).catch(e => console.error('embed fallback edit:', e.message));
+    } catch (e) {
+        console.error('ensureVideoEmbedFallback:', e.message);
+    }
+}
+
 async function sendNotification(w, post) {
     const guild = client.guilds.cache.get(w.guild_id);
     const channel = guild?.channels.cache.get(w.channel_id);
@@ -936,10 +988,13 @@ async function sendNotification(w, post) {
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
     let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
-    // For YouTube/TikTok, make sure the raw video URL is present on its own so Discord
-    // auto-generates a playable video embed beneath the message (not just a thumbnail).
+    // For YouTube/TikTok, make sure a URL that Discord will actually unfurl into a
+    // playable video is present on its own line (not just inside a custom embed).
     const wantsNativeVideo = NATIVE_VIDEO_PLATFORMS.has(w.platform) && post.url;
-    if (wantsNativeVideo && !content.includes(post.url)) content = `${content}\n${post.url}`;
+    if (wantsNativeVideo) {
+        const embedUrl = embeddableUrl(w.platform, post.url);
+        content = content.includes(post.url) ? content.split(post.url).join(embedUrl) : `${content}\n${embedUrl}`;
+    }
     if (w.role_id) content = `<@&${w.role_id}> ${content}`;
     const linkRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setLabel(buttonLabelFor(w.platform, post)).setStyle(ButtonStyle.Link).setURL(post.url).setEmoji(p.emojiButton)
@@ -947,8 +1002,13 @@ async function sendNotification(w, post) {
     if (wantsNativeVideo) {
         // Discord's native video unfurl (from the raw URL above) already shows the title,
         // thumbnail, and channel/author — a custom embed on top of that is redundant.
-        return channel.send({ content, components: [linkRow] }).catch(e => { console.error('send notification:', e.message); return null; });
+        const sent = await channel.send({ content, components: [linkRow] }).catch(e => { console.error('send notification:', e.message); return null; });
+        // Discord's crawler occasionally fails to unfurl TikTok links even via the mirror
+        // domain — check back shortly and backfill a manual embed if nothing showed up.
+        if (sent && w.platform === 'tiktok') ensureVideoEmbedFallback(channel, sent.id, post);
+        return sent;
     }
+
     const embed = new EmbedBuilder()
         .setColor(post.isLive ? '#FF0000' : p.color)
         .setAuthor({ name: `${post.author || w.handle} • ${p.label}${typeLabel}` })
