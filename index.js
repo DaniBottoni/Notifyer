@@ -203,7 +203,17 @@ const PLATFORM_NOTIFY_TYPES = {
     tiktok:    [{ id: 'videos', label: 'Videos', description: 'New TikTok videos' }],
 };
 
-const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+// Two poll cadences instead of one uniform interval:
+//  - "Fast" platforms are all backed by official, generously-rate-limited APIs
+//    (TikTok's video.list/query and Instagram's oauth Graph API both allow 600+
+//    req/min; Twitch Helix and Kick's API are similarly generous) — nothing stops
+//    us from checking these often, so we poll them close to real-time.
+//  - "Slow" platforms are unofficial/scraped (YouTube's unofficial paths, Nitter
+//    for Twitter/X) and need the conservative cadence to avoid getting blocked.
+const FAST_POLL_INTERVAL_MS = 20 * 1000; // 20 seconds
+const SLOW_POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+const FAST_POLL_PLATFORMS = new Set(['tiktok', 'instagram', 'twitch', 'kick']);
+const SLOW_POLL_PLATFORMS = new Set(['youtube', 'twitter']);
 
 // ── DB ─────────────────────────────────────────────────────────────────────
 async function initDB() {
@@ -1050,12 +1060,17 @@ async function markStreamOffline(w) {
     }
 }
 
-let pollInProgress = false;
-async function pollAll() {
-    if (pollInProgress) return;
-    pollInProgress = true;
+// pollInProgress is keyed per call-site (fast loop / slow loop / manual /social
+// check) so the two cadences never block on each other — they touch disjoint
+// platform sets anyway, so there's no risk of double-processing the same watch.
+const pollInProgress = {};
+async function pollAll(platforms = null) {
+    const lockKey = platforms ? [...platforms].sort().join(',') : 'all';
+    if (pollInProgress[lockKey]) return;
+    pollInProgress[lockKey] = true;
     try {
-        const watches = await getAllWatches();
+        let watches = await getAllWatches();
+        if (platforms) watches = watches.filter(w => platforms.has(w.platform));
         for (const w of watches) {
             if (!w.active) continue;
             const minInterval = PLATFORM_MIN_INTERVAL_MS[w.platform];
@@ -1125,7 +1140,7 @@ async function pollAll() {
             await new Promise(r => setTimeout(r, jitter));
         }
     } finally {
-        pollInProgress = false;
+        pollInProgress[lockKey] = false;
     }
 }
 
@@ -1322,7 +1337,7 @@ const HELP_CATEGORIES = [
                 { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') },
                 { name: '⚠️ Twitter/X unavailable', value: 'This bot reads X posts through public Nitter mirrors. X Corp sent legal cease-and-desist letters to the Nitter project in August 2026, and every public mirror has since gone offline — so Twitter/X tracking currently doesn\'t work. Other platforms are unaffected, and this will resume automatically if a mirror ever comes back.' },
                 { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`. For Live messages specifically, `{is/was}` renders as "is" when the stream starts and "was" once it ends — so one message works for both.' },
-                { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
+                { name: 'Notes', value: 'TikTok, Instagram, Twitch, and Kick are checked about every 20 seconds; YouTube and Twitter are checked every 2 minutes (they rely on unofficial/scraped access, which needs a gentler pace). New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
                 { name: 'Links', value: `[GitHub](https://github.com/DaniBottoni/Notifyer/tree/main) • [top.gg](https://top.gg/bot/1515779889737896006)` },
             ),
@@ -1380,9 +1395,11 @@ client.once('ready', async () => {
     ];
     await client.application.commands.set(commands).catch(e => console.error('command registration:', e));
 
-    // Start polling
-    pollAll().catch(e => console.error('initial poll:', e.message));
-    setInterval(() => pollAll().catch(e => console.error('poll loop:', e.message)), POLL_INTERVAL_MS);
+    // Start polling — two independent cadences, see FAST/SLOW_POLL_* above.
+    pollAll(FAST_POLL_PLATFORMS).catch(e => console.error('initial fast poll:', e.message));
+    pollAll(SLOW_POLL_PLATFORMS).catch(e => console.error('initial slow poll:', e.message));
+    setInterval(() => pollAll(FAST_POLL_PLATFORMS).catch(e => console.error('fast poll loop:', e.message)), FAST_POLL_INTERVAL_MS);
+    setInterval(() => pollAll(SLOW_POLL_PLATFORMS).catch(e => console.error('slow poll loop:', e.message)), SLOW_POLL_INTERVAL_MS);
 
     // Announce the support server to existing guilds, once each.
     for (const guild of client.guilds.cache.values()) {
