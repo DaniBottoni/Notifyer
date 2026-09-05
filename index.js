@@ -167,14 +167,18 @@ const PLATFORMS = {
 // Custom (application) emoji support — optional. Upload each platform's icon as an
 // application emoji (Discord Developer Portal → your app → Emojis, or the API —
 // these work in every server the bot is in, no per-guild upload needed), then set
-// EMOJI_<PLATFORM>_ID (and EMOJI_<PLATFORM>_NAME if it's not just the platform key)
-// as env vars, e.g. EMOJI_YOUTUBE_ID=123456789012345678. Leave unset to keep using
-// the plain Unicode emoji above — nothing breaks either way.
-// p.emojiTag   → for embed/text display, e.g. `${p.emojiTag} ${p.label}`
+// EMOJI_<PLATFORM> to the full emoji tag Discord gives you (e.g. copy the emoji from
+// the portal or a message: EMOJI_YOUTUBE=<:yt_icon:1544605242748960859>). Leave unset
+// to keep using the plain Unicode emoji above — nothing breaks either way.
+// (EMOJI_<PLATFORM>_ID / EMOJI_<PLATFORM>_NAME still work too, as separate values, for
+// anyone already using that format — EMOJI_<PLATFORM> just takes priority if both are set.)
+// p.emojiTag    → for embed/text display, e.g. `${p.emojiTag} ${p.label}`
 // p.emojiButton → for ButtonBuilder.setEmoji(p.emojiButton)
+const EMOJI_TAG_RE = /^<a?:(\w+):(\d+)>$/;
 for (const [key, p] of Object.entries(PLATFORMS)) {
-    const id = process.env[`EMOJI_${key.toUpperCase()}_ID`];
-    const name = process.env[`EMOJI_${key.toUpperCase()}_NAME`] || key;
+    const tagMatch = (process.env[`EMOJI_${key.toUpperCase()}`] || '').match(EMOJI_TAG_RE);
+    const id = tagMatch?.[2] || process.env[`EMOJI_${key.toUpperCase()}_ID`];
+    const name = tagMatch?.[1] || process.env[`EMOJI_${key.toUpperCase()}_NAME`] || key;
     p.emojiTag = id ? `<:${name}:${id}>` : p.emoji;
     p.emojiButton = id ? { id, name } : p.emoji;
 }
