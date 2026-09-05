@@ -230,6 +230,9 @@ async function initDB() {
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS message_templates JSONB;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS social_link_id INTEGER;
         ALTER TABLE watches ADD COLUMN IF NOT EXISTS legacy_migrated BOOLEAN NOT NULL DEFAULT FALSE;
+        -- Tracks the Discord message ID of an active "went live" notification, so it can be
+        -- edited to "was live" once the stream ends. NULL when nothing is currently live.
+        ALTER TABLE watches ADD COLUMN IF NOT EXISTS live_message_id TEXT;
         CREATE TABLE IF NOT EXISTS social_links (
             id SERIAL PRIMARY KEY,
             guild_id TEXT NOT NULL,
@@ -366,6 +369,9 @@ async function updateWatchNotifyTypes(guildId, id, types) {
 async function updateWatchMessageTemplates(guildId, id, templatesObj) {
     // Saving explicitly counts as "reviewed" — clear the outdated/legacy warning.
     await pool.query('UPDATE watches SET message_templates = $1, legacy_migrated = FALSE WHERE guild_id = $2 AND id = $3', [JSON.stringify(templatesObj), guildId, id]);
+}
+async function setWatchLiveMessage(id, messageId) {
+    await pool.query('UPDATE watches SET live_message_id = $1 WHERE id = $2', [messageId, id]);
 }
 async function setWatchSocialLink(guildId, id, socialLinkId) {
     await pool.query('UPDATE watches SET social_link_id = $1 WHERE guild_id = $2 AND id = $3', [socialLinkId, guildId, id]);
@@ -611,17 +617,24 @@ async function getTwitchToken() {
 // Cache login→id mappings to avoid repeated lookups
 const twitchUserIdCache = new Map();
 async function getTwitchUserId(login) {
+    return (await getTwitchUserInfo(login)).id;
+}
+// Cache both the numeric ID and profile picture — the latter is used as a fallback
+// thumbnail when a specific stream/VOD doesn't have its own preview image yet
+// (common for very fresh streams/VODs, and Twitch sometimes just leaves it empty).
+async function getTwitchUserInfo(login) {
     if (twitchUserIdCache.has(login)) return twitchUserIdCache.get(login);
     const data = await fetchTwitch(`users?login=${encodeURIComponent(login)}`);
     const user = data.data?.[0];
     if (!user) throw new Error(`Twitch user "${login}" not found`);
-    twitchUserIdCache.set(login, user.id);
-    return user.id;
+    const info = { id: user.id, profileImageUrl: user.profile_image_url || null };
+    twitchUserIdCache.set(login, info);
+    return info;
 }
 
 // Returns array of posts: [{id, url, title, author, thumbnail, timestamp, postType}]
 async function fetchLatestTwitchAll(handle) {
-    const userId = await getTwitchUserId(handle);
+    const { id: userId, profileImageUrl } = await getTwitchUserInfo(handle);
     const [streamData, vodData] = await Promise.all([
         fetchTwitch(`streams?user_id=${userId}`),
         fetchTwitch(`videos?user_id=${userId}&type=archive&first=1`),
@@ -630,12 +643,15 @@ async function fetchLatestTwitchAll(handle) {
 
     const stream = streamData.data?.[0];
     if (stream) {
+        const liveThumb = (stream.thumbnail_url || '').replace('{width}', '1280').replace('{height}', '720');
         results.push({
             id: `live_${stream.id}`,
             url: `https://www.twitch.tv/${handle}`,
             title: stream.title || `${handle} is live!`,
             author: stream.user_name || handle,
-            thumbnail: (stream.thumbnail_url || '').replace('{width}', '1280').replace('{height}', '720'),
+            // Fresh streams sometimes don't have a preview snapshot yet — fall back to the
+            // channel's profile picture rather than showing no image at all.
+            thumbnail: liveThumb || profileImageUrl,
             timestamp: stream.started_at,
             postType: 'live',
             isLive: true,
@@ -644,12 +660,15 @@ async function fetchLatestTwitchAll(handle) {
 
     const vod = vodData.data?.[0];
     if (vod) {
+        const vodThumb = (vod.thumbnail_url || '').replace('%{width}', '1280').replace('%{height}', '720');
         results.push({
             id: vod.id,
             url: vod.url,
             title: vod.title,
             author: vod.user_name || handle,
-            thumbnail: (vod.thumbnail_url || '').replace('%{width}', '1280').replace('%{height}', '720'),
+            // Twitch often leaves thumbnail_url empty for VODs (especially right after a
+            // stream ends, before the thumbnail's generated) — same fallback as above.
+            thumbnail: vodThumb || profileImageUrl,
             timestamp: vod.published_at || vod.created_at,
             postType: 'vods',
         });
@@ -683,21 +702,30 @@ async function getKickAppToken() {
     return kickToken;
 }
 
-// Cache slug→broadcaster_user_id mappings to avoid repeated lookups
+// Cache slug→channel info mappings to avoid repeated lookups. Stores the broadcaster ID
+// plus a fallback image (profile/banner picture) for when a specific livestream doesn't
+// have its own thumbnail set.
 const kickBroadcasterIdCache = new Map();
-async function getKickBroadcasterId(slug) {
+async function getKickChannelInfo(slug) {
     if (kickBroadcasterIdCache.has(slug)) return kickBroadcasterIdCache.get(slug);
     const data = await fetchKick(`channels?slug=${encodeURIComponent(slug)}`);
     const channel = data?.data?.[0];
     if (!channel) throw new Error(`Kick channel "${slug}" not found`);
-    kickBroadcasterIdCache.set(slug, channel.broadcaster_user_id);
-    return channel.broadcaster_user_id;
+    const info = {
+        id: channel.broadcaster_user_id,
+        fallbackThumb: channel.profile_picture || channel.banner_picture || null,
+    };
+    kickBroadcasterIdCache.set(slug, info);
+    return info;
+}
+async function getKickBroadcasterId(slug) {
+    return (await getKickChannelInfo(slug)).id;
 }
 
 // Returns array of posts: [{id, url, title, author, thumbnail, timestamp, postType, isLive}]
 // — only ever 0 or 1 entries, since Kick's public API currently exposes live status only.
 async function fetchLatestKickAll(handle) {
-    const broadcasterId = await getKickBroadcasterId(handle);
+    const { id: broadcasterId, fallbackThumb } = await getKickChannelInfo(handle);
     const data = await fetchKick(`livestreams?broadcaster_user_id=${broadcasterId}`);
     const stream = data?.data?.[0];
     if (!stream) return [];
@@ -706,7 +734,8 @@ async function fetchLatestKickAll(handle) {
         url: `https://kick.com/${handle}`,
         title: stream.stream_title || `${handle} is live!`,
         author: handle,
-        thumbnail: (stream.thumbnail?.url || stream.thumbnail) || null,
+        // Fall back to the channel's own picture if this specific stream has no thumbnail set.
+        thumbnail: (stream.thumbnail?.url || stream.thumbnail) || fallbackThumb || null,
         timestamp: stream.started_at,
         postType: 'live',
         isLive: true,
@@ -820,6 +849,13 @@ async function fetchLatestTikTokAll(link) {
 
 // ── Message templating ────────────────────────────────────────────────────
 const DEFAULT_TEMPLATE = '🔔 **{author}** just posted on {platform}!\n{url}';
+// Nicer default specifically for live-stream notifications — uses the {is/was} token
+// (see renderTemplate) so the same wording works for both "went live" and "ended".
+const LIVE_DEFAULT_TEMPLATE = '🔴 **{author}** {is/was} live on {platform}!\n{url}';
+// Shown wherever someone's about to set a custom message, so new users don't have to
+// dig through /help to discover these — Discord modals can't show static text inside
+// the form itself, so this goes on the embed screen right before the modal opens.
+const PLACEHOLDER_HELP = '`{author}` `{handle}` `{platform}` `{title}` `{url}` — for Live, also `{is/was}` (is/was live)';
 // Resolves the message template for a watch + post, preferring a per-post-type
 // override (w.message_templates[post.postType]) over the watch's single
 // message_template, over the global default.
@@ -827,9 +863,12 @@ function resolveTemplate(w, post) {
     if (post.postType && w.message_templates && w.message_templates[post.postType]) return w.message_templates[post.postType];
     return w.message_template || null;
 }
-function renderTemplate(template, post, platform, handle) {
-    const tmpl = template || DEFAULT_TEMPLATE;
+// `ended` flips the {is/was} token — pass true when editing a "went live" notification
+// to say the stream ended, false (default) for the original live/normal notification.
+function renderTemplate(template, post, platform, handle, ended = false) {
+    const tmpl = template || (post.postType === 'live' ? LIVE_DEFAULT_TEMPLATE : DEFAULT_TEMPLATE);
     return tmpl
+        .replace(/\{is\/was\}/g, ended ? 'was' : 'is')
         .replace(/\{author\}/g, post.author || handle)
         .replace(/\{handle\}/g, handle)
         .replace(/\{platform\}/g, PLATFORMS[platform].label)
@@ -867,7 +906,7 @@ const NATIVE_VIDEO_PLATFORMS = new Set(['youtube', 'tiktok']);
 async function sendNotification(w, post) {
     const guild = client.guilds.cache.get(w.guild_id);
     const channel = guild?.channels.cache.get(w.channel_id);
-    if (!channel) return;
+    if (!channel) return null;
     const p = PLATFORMS[w.platform];
     const typeLabel = post.postType ? ` (${PLATFORM_NOTIFY_TYPES[w.platform]?.find(t => t.id === post.postType)?.label || post.postType})` : '';
     let content = renderTemplate(resolveTemplate(w, post), post, w.platform, w.handle);
@@ -882,8 +921,7 @@ async function sendNotification(w, post) {
     if (wantsNativeVideo) {
         // Discord's native video unfurl (from the raw URL above) already shows the title,
         // thumbnail, and channel/author — a custom embed on top of that is redundant.
-        await channel.send({ content, components: [linkRow] }).catch(e => console.error('send notification:', e.message));
-        return;
+        return channel.send({ content, components: [linkRow] }).catch(e => { console.error('send notification:', e.message); return null; });
     }
     const embed = new EmbedBuilder()
         .setColor(post.isLive ? '#FF0000' : p.color)
@@ -893,7 +931,37 @@ async function sendNotification(w, post) {
         .setTimestamp(post.timestamp ? new Date(post.timestamp) : new Date());
     if (post.isLive) embed.addFields({ name: '🔴 LIVE', value: 'Stream is live now!', inline: true });
     if (post.thumbnail) embed.setImage(post.thumbnail);
-    await channel.send({ content, embeds: [embed], components: [linkRow] }).catch(e => console.error('send notification:', e.message));
+    return channel.send({ content, embeds: [embed], components: [linkRow] }).catch(e => { console.error('send notification:', e.message); return null; });
+}
+
+// Edits a previously-sent "went live" message to show the stream has ended, once a
+// later poll finds the channel no longer live. Falls back to just clearing the tracked
+// message ID if the message or channel can no longer be found (deleted, permissions, etc.).
+async function markStreamOffline(w) {
+    if (!w.live_message_id) return;
+    try {
+        const guild = client.guilds.cache.get(w.guild_id);
+        const channel = guild?.channels.cache.get(w.channel_id);
+        const msg = channel ? await channel.messages.fetch(w.live_message_id).catch(() => null) : null;
+        if (msg) {
+            const p = PLATFORMS[w.platform];
+            // Reconstruct a minimal post-like object so the person's own custom "live"
+            // message (with {is/was}) renders here too, instead of a hardcoded string.
+            const syntheticPost = { author: w.handle, url: profileUrl(w.platform, w.handle), title: null, postType: 'live' };
+            const content = renderTemplate(resolveTemplate(w, syntheticPost), syntheticPost, w.platform, w.handle, true);
+            const endedEmbed = new EmbedBuilder()
+                .setColor('#808080')
+                .setAuthor({ name: `${w.handle} • ${p.label}` })
+                .setDescription('Stream ended.')
+                .setTimestamp();
+            await msg.edit({ content, embeds: [endedEmbed], components: msg.components })
+                .catch(e => console.error(`edit live-ended message (${w.id}):`, e.message));
+        }
+    } catch (e) {
+        console.error(`markStreamOffline (${w.id}):`, e.message);
+    } finally {
+        await setWatchLiveMessage(w.id, null);
+    }
 }
 
 let pollInProgress = false;
@@ -930,8 +998,14 @@ async function pollAll() {
                         if (!shouldNotify(w, post)) { newSeenIds = [...new Set([post.id, ...newSeenIds])].slice(0, 20); updated = true; continue; }
                         newSeenIds = [...new Set([post.id, ...newSeenIds])].slice(0, 20);
                         updated = true;
-                        await sendNotification(w, post);
+                        const sent = await sendNotification(w, post);
+                        if (post.isLive && sent) await setWatchLiveMessage(w.id, sent.id);
                     }
+                    // Stream-ended detection: we were tracking a "went live" message, but this
+                    // poll's results no longer include a live entry — edit that message to
+                    // show it ended instead of leaving it saying "is live" forever. (No-op for
+                    // Instagram/TikTok posts, which never set isLive in the first place.)
+                    if (!posts.some(p => p.isLive) && w.live_message_id) await markStreamOffline(w);
                     if (w.last_post_id === null && posts.length) {
                         // Seed baseline from first check
                         await updateLastPost(w.id, posts[0].id, posts.map(p => p.id));
@@ -1037,7 +1111,9 @@ function buildPerTypeMessageModal(w) {
             new TextInputBuilder().setCustomId(`tmpl_${t.id}`).setLabel(`Message for ${t.label} (blank = default)`)
                 .setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)
                 .setValue(templates[t.id] || '')
-                .setPlaceholder('{author} just posted on {platform}!\n{url}')
+                .setPlaceholder(t.id === 'live'
+                    ? '{author} {is/was} live on {platform}!\n{url}'
+                    : '{author} just posted on {platform}!\n{url}')
         ))
     );
     return modal;
@@ -1057,6 +1133,7 @@ function buildManageView(w) {
             { name: 'Default message', value: w.message_template ? `\`${w.message_template}\`` : `Default: \`${DEFAULT_TEMPLATE}\`` },
         );
     if (perTypeLines.length) embed.addFields({ name: 'Per-type message overrides', value: perTypeLines.join('\n') });
+    embed.addFields({ name: 'Placeholders', value: PLACEHOLDER_HELP });
     if (p.unavailable) {
         embed.addFields({ name: '⚠️ Currently unavailable', value: `${p.label} isn't working right now — see \`/help\` → Info for why. Notifications won't fire until this is resolved, but everything here stays saved.` });
     }
@@ -1120,7 +1197,7 @@ const HELP_CATEGORIES = [
             .addFields(
                 { name: 'Supported platforms', value: Object.values(PLATFORMS).map(p => `${p.emojiTag} ${p.label}${p.unavailable ? ' ⚠️' : ''}`).join('  ·  ') },
                 { name: '⚠️ Twitter/X unavailable', value: 'This bot reads X posts through public Nitter mirrors. X Corp sent legal cease-and-desist letters to the Nitter project in August 2026, and every public mirror has since gone offline — so Twitter/X tracking currently doesn\'t work. Other platforms are unaffected, and this will resume automatically if a mirror ever comes back.' },
-                { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`.' },
+                { name: 'Placeholders', value: 'Custom messages support `{author}`, `{handle}`, `{platform}`, `{title}`, and `{url}`. For Live messages specifically, `{is/was}` renders as "is" when the stream starts and "was" once it ends — so one message works for both.' },
                 { name: 'Notes', value: 'Checks run every 2 minutes. New watches start tracking from the next post onward (no notification for existing content). Twitter relies on unofficial scraping and may occasionally fail or lag.' },
                 { name: 'Legal', value: `[Terms of Service](${LEGAL_BASE_URL}/terms) • [Privacy Policy](${LEGAL_BASE_URL}/privacy)` },
                 { name: 'Links', value: `[GitHub](https://github.com/DaniBottoni/Notifyer/tree/main) • [top.gg](https://top.gg/bot/1515779889737896006)` },
@@ -1324,7 +1401,8 @@ client.on('interactionCreate', async interaction => {
                 // Single-type platforms (TikTok, Twitter) skip the type-choice step entirely —
                 // there's only one kind of post, so go straight to a "set your message" button.
                 if (types.length <= 1) {
-                    successEmbed.setDescription('One more step — set the notification message below.');
+                    successEmbed.setDescription('One more step — set the notification message below.')
+                        .addFields({ name: 'Placeholders', value: PLACEHOLDER_HELP });
                     const msgRow = new ActionRowBuilder().addComponents(
                         new ButtonBuilder().setCustomId(`socialpertype_open_${watch.id}`).setLabel('Set Message').setStyle(ButtonStyle.Primary)
                     );
@@ -1337,7 +1415,8 @@ client.on('interactionCreate', async interaction => {
                 // instead of separate optional buttons.
                 const typeEmbed = new EmbedBuilder().setColor('#5865F2')
                     .setTitle(`${p.emojiTag} Choose Notification Types`)
-                    .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`);
+                    .setDescription(`Which types of **${p.label}** content do you want notifications for?\nSelect one or more below — you'll set the message for each right after.`)
+                    .addFields({ name: 'Placeholders (for the message you set next)', value: PLACEHOLDER_HELP });
                 const typeRow = new ActionRowBuilder().addComponents(
                     new StringSelectMenuBuilder()
                         .setCustomId(`socialtypeadd_select_${watch.id}`)
