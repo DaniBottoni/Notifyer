@@ -406,6 +406,15 @@ async function getSocialLinkById(id) {
 async function updateSocialLinkTokens(id, accessToken, refreshToken, expiresAt) {
     await pool.query('UPDATE social_links SET access_token = $1, refresh_token = COALESCE($2, refresh_token), expires_at = $3 WHERE id = $4', [accessToken, refreshToken, expiresAt, id]);
 }
+// Deletes a social_links row and detaches any watches still pointing at it
+// (those watches stop polling — see the "not linked yet" guard in pollAll —
+// rather than being deleted outright, so removing a link doesn't silently
+// wipe someone's tracked-account/channel setup).
+async function deleteSocialLink(guildId, id) {
+    await pool.query('UPDATE watches SET social_link_id = NULL WHERE guild_id = $1 AND social_link_id = $2', [guildId, id]);
+    const res = await pool.query('DELETE FROM social_links WHERE guild_id = $1 AND id = $2', [guildId, id]);
+    return res.rowCount > 0;
+}
 async function getWatch(guildId, id) {
     const res = await pool.query('SELECT * FROM watches WHERE guild_id = $1 AND id = $2', [guildId, id]);
     return res.rows[0] || null;
@@ -827,6 +836,23 @@ async function fetchLatestInstagramAll(link) {
 }
 
 // ── TikTok ───────────────────────────────────────────────────────────────
+// Best-effort: invalidates the token on TikTok's side so this app drops off
+// the user's "Manage app permissions" list. If it fails (already expired,
+// network hiccup, etc.) we still proceed to delete our local copy — an
+// already-dead token isn't a reason to keep the row around.
+async function revokeTikTokToken(link) {
+    const cfg = OAUTH_CONFIG.tiktok;
+    if (!cfg.clientId || !cfg.clientSecret || !link.access_token) return { ok: false, reason: 'missing credentials/token' };
+    try {
+        const { status, json } = await postForm('https://open.tiktokapis.com/v2/oauth/revoke/', {
+            client_key: cfg.clientId, client_secret: cfg.clientSecret, token: link.access_token,
+        });
+        if (status >= 200 && status < 300) return { ok: true };
+        return { ok: false, reason: json?.error?.message || json?.error_description || `HTTP ${status}` };
+    } catch (e) {
+        return { ok: false, reason: e.message };
+    }
+}
 async function fetchLatestTikTokAll(link) {
     const fresh = await ensureFreshToken(link);
     const { json } = await postJson(
@@ -1093,7 +1119,45 @@ async function buildWatchListEmbed(guildId) {
     return { embeds: [embed], components };
 }
 
-// True when a watch's per-type messages were auto-migrated from the old
+async function buildSocialLinksEmbed(guildId) {
+    const igLinks = await getSocialLinks(guildId, 'instagram');
+    const ttLinks = await getSocialLinks(guildId, 'tiktok');
+    const allLinks = [...igLinks, ...ttLinks];
+    const embed = new EmbedBuilder().setColor('#5865F2').setTitle('Linked Accounts').setTimestamp()
+        .setDescription('Accounts authorized via `/social link` in this server. Only these can be added with `/social add`.')
+        .addFields(
+            { name: '📸 Instagram', value: igLinks.length ? igLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
+            { name: '🎵 TikTok', value: ttLinks.length ? ttLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
+        );
+    if (!allLinks.length) return { embeds: [embed], components: [] };
+    const components = [
+        new ActionRowBuilder().addComponents(
+            new StringSelectMenuBuilder().setCustomId(`sociallinks_manage_${guildId}`).setPlaceholder('Manage a linked account…')
+                .addOptions(allLinks.slice(0, 25).map(l => ({
+                    label: `${PLATFORMS[l.platform].label} — ${l.external_username}`.slice(0, 100),
+                    value: `${l.platform}:${l.id}`,
+                })))
+        ),
+        new ActionRowBuilder().addComponents(refreshBtn(`sociallinks_refresh_${guildId}`)),
+    ];
+    return { embeds: [embed], components };
+}
+
+function buildSocialLinkManageView(link) {
+    const p = PLATFORMS[link.platform];
+    const embed = new EmbedBuilder().setColor(p.color).setTitle(`Manage Link — ${p.emojiTag} ${link.external_username}`).setTimestamp()
+        .addFields(
+            { name: 'Platform', value: p.label, inline: true },
+            { name: 'Linked by', value: link.linked_by, inline: true },
+        );
+    const components = [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`sociallinkmanage_unlink_${link.platform}_${link.id}`).setLabel('Unlink').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`sociallinkmanage_back_${link.guild_id}`).setLabel('← Back to List').setStyle(ButtonStyle.Secondary),
+    )];
+    return { embeds: [embed], components };
+}
+
+
 // single message_template and haven't been reviewed/edited since.
 function isLegacyMessageFormat(w) {
     return !!w.legacy_migrated;
@@ -1181,7 +1245,7 @@ const HELP_CATEGORIES = [
             .setDescription('Instagram and TikTok only expose their APIs through per-account OAuth consent — an account has to explicitly authorize this bot before it can be tracked.')
             .addFields(
                 { name: '/social link', value: 'Connect an Instagram or TikTok account via OAuth so it can be tracked. Sends a link the account owner clicks and logs in with.' },
-                { name: '/social links', value: 'View accounts already linked via OAuth in this server.' },
+                { name: '/social links', value: 'View accounts linked via OAuth in this server. Pick one from the dropdown to unlink it — revokes the token with TikTok directly; for Instagram it removes our local copy (the account owner can also pull access from Instagram\'s own settings).' },
             ),
     },
     {
@@ -1345,6 +1409,7 @@ client.on('interactionCreate', async interaction => {
                 if (watches.length >= 50) return interaction.editReply('❌ This server has reached the maximum of 50 tracked accounts.');
 
                 let post = null;
+                let baselineSeenIds = [];
                 let socialLinkId = null;
                 if (PLATFORMS[platform].oauth) {
                     // Instagram/TikTok can only be watched for accounts that have gone through
@@ -1358,6 +1423,10 @@ client.on('interactionCreate', async interaction => {
                     try {
                         const posts = platform === 'instagram' ? await fetchLatestInstagramAll(link) : await fetchLatestTikTokAll(link);
                         post = posts[0] || null;
+                        // Seed seen_post_ids with EVERY post returned by this check, not just the
+                        // newest — otherwise the next poll (or /social check) treats the older
+                        // ones as "unseen" and fires notifications for pre-existing content.
+                        baselineSeenIds = posts.map(p => p.id);
                     } catch (e) {
                         return interaction.editReply(`❌ Couldn't fetch that account: ${e.message}`);
                     }
@@ -1366,11 +1435,14 @@ client.on('interactionCreate', async interaction => {
                         if (platform === 'twitch') {
                             const posts = await fetchLatestTwitchAll(handle);
                             post = posts[0] || null;
+                            baselineSeenIds = posts.map(p => p.id);
                         } else if (platform === 'kick') {
                             const posts = await fetchLatestKickAll(handle);
                             post = posts[0] || null;
+                            baselineSeenIds = posts.map(p => p.id);
                         } else {
                             post = await fetchLatestPost(platform, handle);
+                            baselineSeenIds = post?.id ? [post.id] : [];
                         }
                     } catch (e) {
                         if (/HTTP 429/.test(e.message)) {
@@ -1384,8 +1456,9 @@ client.on('interactionCreate', async interaction => {
 
                 const watch = await addWatch({ guildId, platform, handle, channelId: channel.id, addedBy: interaction.user.tag });
                 if (socialLinkId) await setWatchSocialLink(guildId, watch.id, socialLinkId);
-                // Seed last_post_id so the first poll doesn't fire a notification for existing content
-                await updateLastPost(watch.id, post?.id || null);
+                // Seed last_post_id AND seen_post_ids so the first poll doesn't fire
+                // notifications for content that already existed before tracking started.
+                await updateLastPost(watch.id, post?.id || null, baselineSeenIds);
 
                 const p = PLATFORMS[platform];
                 const types = PLATFORM_NOTIFY_TYPES[platform];
@@ -1507,14 +1580,8 @@ client.on('interactionCreate', async interaction => {
             }
 
             if (sub === 'links') {
-                const igLinks = await getSocialLinks(guildId, 'instagram');
-                const ttLinks = await getSocialLinks(guildId, 'tiktok');
-                const embed = E('#5865F2', 'Linked Accounts').setDescription('Accounts authorized via `/social link` in this server. Only these can be added with `/social add`.');
-                embed.addFields(
-                    { name: '📸 Instagram', value: igLinks.length ? igLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
-                    { name: '🎵 TikTok', value: ttLinks.length ? ttLinks.map(l => `• ${l.external_username} (linked by ${l.linked_by})`).join('\n') : '*(none linked)*' },
-                );
-                return reply({ embeds: [embed], flags: [MessageFlags.Ephemeral] });
+                const { embeds, components } = await buildSocialLinksEmbed(guildId);
+                return reply({ embeds, components, flags: [MessageFlags.Ephemeral] });
             }
 
             if (sub === 'oauthdebug') {
@@ -1590,6 +1657,63 @@ client.on('interactionCreate', async interaction => {
         if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
         const { embeds, components } = await buildWatchListEmbed(guildId);
         return interaction.update({ embeds, components });
+    }
+
+    // ── Buttons: refresh linked-accounts list ───────────────────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('sociallinks_refresh_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const { embeds, components } = await buildSocialLinksEmbed(guildId);
+        return interaction.update({ embeds, components });
+    }
+
+    // ── Select: open manage view for a linked account ───────────────────────
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('sociallinks_manage_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const [platform, idStr] = interaction.values[0].split(':');
+        const link = await getSocialLinkById(parseInt(idStr, 10));
+        if (!link || link.guild_id !== guildId || link.platform !== platform) {
+            return interaction.reply({ content: '❌ Linked account not found (it may have been removed).', flags: [MessageFlags.Ephemeral] });
+        }
+        const { embeds, components } = buildSocialLinkManageView(link);
+        return interaction.update({ embeds, components });
+    }
+
+    // ── Buttons: linked-account manage view actions ─────────────────────────
+    if (interaction.isButton() && interaction.customId.startsWith('sociallinkmanage_')) {
+        if (!await hasCommandPermission(interaction, guildId)) return interaction.reply({ content: '❌ No permission.', flags: [MessageFlags.Ephemeral] });
+        const parts = interaction.customId.split('_'); // sociallinkmanage_<action>_[platform_]<id>
+        const action = parts[1];
+
+        if (action === 'back') {
+            const { embeds, components } = await buildSocialLinksEmbed(guildId);
+            return interaction.update({ embeds, components });
+        }
+
+        if (action === 'unlink') {
+            const platform = parts[2];
+            const id = parseInt(parts[3], 10);
+            const link = await getSocialLinkById(id);
+            if (!link || link.guild_id !== guildId) {
+                const { embeds, components } = await buildSocialLinksEmbed(guildId);
+                return interaction.update({ content: '❌ Linked account not found (it may have already been removed).', embeds, components });
+            }
+
+            let revokeNote = '';
+            if (platform === 'tiktok') {
+                const result = await revokeTikTokToken(link);
+                revokeNote = result.ok
+                    ? '\nToken revoked with TikTok — the bot no longer shows in their Manage app permissions page.'
+                    : `\n⚠️ Couldn't revoke the token with TikTok (${result.reason}) — removing our local copy anyway, but the account owner may want to remove app access manually from TikTok's app permissions settings.`;
+            } else if (platform === 'instagram') {
+                // Meta doesn't expose an app-triggered revoke endpoint for this login
+                // type — only the account owner can pull access, from Instagram itself.
+                revokeNote = '\nInstagram doesn\'t let apps revoke their own tokens — if the account owner wants to fully disconnect on their end too, they can do it from Instagram → Settings → Apps and Websites → Notifyer → Remove.';
+            }
+
+            await deleteSocialLink(guildId, id);
+            const { embeds, components } = await buildSocialLinksEmbed(guildId);
+            return interaction.update({ content: `✅ Unlinked **${link.external_username}** (${PLATFORMS[platform].label}). Any watches for that account are now paused until it's re-linked and re-added.${revokeNote}`, embeds, components });
+        }
     }
 
     // ── Select: open manage view for a watch ────────────────────────────────
